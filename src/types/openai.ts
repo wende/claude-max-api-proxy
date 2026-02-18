@@ -25,11 +25,31 @@ export interface OpenAIChatRequest {
   user?: string; // Used for session mapping
 }
 
+export interface OpenAIToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface OpenAIToolCallChunk {
+  index: number;
+  id?: string;
+  type?: "function";
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
+
 export interface OpenAIChatResponseChoice {
   index: number;
   message: {
     role: "assistant";
     content: string;
+    tool_calls?: OpenAIToolCall[];
   };
   finish_reason: "stop" | "length" | "content_filter" | null;
 }
@@ -50,6 +70,7 @@ export interface OpenAIChatResponse {
 export interface OpenAIChatChunkDelta {
   role?: "assistant";
   content?: string;
+  tool_calls?: OpenAIToolCallChunk[];
 }
 
 export interface OpenAIChatChunkChoice {

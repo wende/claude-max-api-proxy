@@ -15,7 +15,15 @@ import type {
   ClaudeCliResult,
   ClaudeCliStreamEvent,
 } from "../types/claude-cli.js";
-import { isAssistantMessage, isResultMessage, isContentDelta } from "../types/claude-cli.js";
+import {
+  isAssistantMessage,
+  isResultMessage,
+  isContentDelta,
+  isTextBlockStart,
+  isToolUseBlockStart,
+  isInputJsonDelta,
+  isContentBlockStop,
+} from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 
 export interface SubprocessOptions {
@@ -209,8 +217,25 @@ export class ClaudeSubprocess extends EventEmitter {
         const message: ClaudeCliMessage = JSON.parse(trimmed);
         this.emit("message", message);
 
+        if (isTextBlockStart(message)) {
+          // Emit when a new text content block starts (for inserting separators)
+          this.emit("text_block_start", message as ClaudeCliStreamEvent);
+        }
+
+        if (isToolUseBlockStart(message)) {
+          this.emit("tool_use_start", message as ClaudeCliStreamEvent);
+        }
+
+        if (isInputJsonDelta(message)) {
+          this.emit("input_json_delta", message as ClaudeCliStreamEvent);
+        }
+
+        if (isContentBlockStop(message)) {
+          this.emit("content_block_stop", message as ClaudeCliStreamEvent);
+        }
+
         if (isContentDelta(message)) {
-          // Emit content delta for streaming
+          // Emit content delta for streaming (text_delta only)
           this.emit("content_delta", message as ClaudeCliStreamEvent);
         } else if (isAssistantMessage(message)) {
           this.emit("assistant", message);

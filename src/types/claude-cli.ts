@@ -36,10 +36,19 @@ export interface ClaudeCliHookResponse {
   outcome: "success" | "error";
 }
 
-export interface ClaudeCliAssistantContent {
+export interface ClaudeCliTextContent {
   type: "text";
   text: string;
 }
+
+export interface ClaudeCliToolUseContent {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+export type ClaudeCliAssistantContent = ClaudeCliTextContent | ClaudeCliToolUseContent;
 
 export interface ClaudeCliAssistant {
   type: "assistant";
@@ -98,10 +107,17 @@ export interface ClaudeCliStreamEvent {
     delta?: {
       type: "text_delta";
       text: string;
+    } | {
+      type: "input_json_delta";
+      partial_json: string;
     };
     content_block?: {
       type: "text";
       text: string;
+    } | {
+      type: "tool_use";
+      id: string;
+      name: string;
     };
     message?: {
       model: string;
@@ -141,7 +157,39 @@ export function isStreamEvent(msg: ClaudeCliMessage): msg is ClaudeCliStreamEven
 }
 
 export function isContentDelta(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
-  return isStreamEvent(msg) && msg.event.type === "content_block_delta";
+  return (
+    isStreamEvent(msg) &&
+    msg.event.type === "content_block_delta" &&
+    msg.event.delta?.type === "text_delta"
+  );
+}
+
+export function isToolUseBlockStart(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return (
+    isStreamEvent(msg) &&
+    msg.event.type === "content_block_start" &&
+    msg.event.content_block?.type === "tool_use"
+  );
+}
+
+export function isInputJsonDelta(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return (
+    isStreamEvent(msg) &&
+    msg.event.type === "content_block_delta" &&
+    msg.event.delta?.type === "input_json_delta"
+  );
+}
+
+export function isContentBlockStop(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return isStreamEvent(msg) && msg.event.type === "content_block_stop";
+}
+
+export function isTextBlockStart(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return (
+    isStreamEvent(msg) &&
+    msg.event.type === "content_block_start" &&
+    msg.event.content_block?.type === "text"
+  );
 }
 
 export function isSystemInit(msg: ClaudeCliMessage): msg is ClaudeCliInit {

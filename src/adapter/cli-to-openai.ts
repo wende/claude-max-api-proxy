@@ -3,7 +3,7 @@
  */
 
 import type { ClaudeCliAssistant, ClaudeCliResult } from "../types/claude-cli.js";
-import type { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
+import type { OpenAIChatResponse, OpenAIChatChunk, OpenAIToolCall } from "../types/openai.js";
 
 /**
  * Extract text content from Claude CLI assistant message
@@ -12,7 +12,7 @@ export function extractTextContent(message: ClaudeCliAssistant): string {
   return message.message.content
     .filter((c) => c.type === "text")
     .map((c) => c.text)
-    .join("");
+    .join("\n\n");
 }
 
 /**
@@ -67,12 +67,22 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
  */
 export function cliResultToOpenai(
   result: ClaudeCliResult,
-  requestId: string
+  requestId: string,
+  toolCalls?: OpenAIToolCall[]
 ): OpenAIChatResponse {
   // Get model from modelUsage or default
   const modelName = result.modelUsage
     ? Object.keys(result.modelUsage)[0]
     : "claude-sonnet-4";
+
+  const message: OpenAIChatResponse["choices"][0]["message"] = {
+    role: "assistant",
+    content: result.result,
+  };
+
+  if (toolCalls && toolCalls.length > 0) {
+    message.tool_calls = toolCalls;
+  }
 
   return {
     id: `chatcmpl-${requestId}`,
@@ -82,10 +92,7 @@ export function cliResultToOpenai(
     choices: [
       {
         index: 0,
-        message: {
-          role: "assistant",
-          content: result.result,
-        },
+        message,
         finish_reason: "stop",
       },
     ],
