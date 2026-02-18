@@ -42,7 +42,7 @@ export interface SubprocessEvents {
   raw: (line: string) => void;
 }
 
-const DEFAULT_TIMEOUT = 300000; // 5 minutes
+const DEFAULT_TIMEOUT = 900000; // 15 minutes
 
 /**
  * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
@@ -98,7 +98,7 @@ export class ClaudeSubprocess extends EventEmitter {
    * Start the Claude CLI subprocess with the given prompt
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const args = this.buildArgs(prompt, options);
+    const args = this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
     return new Promise((resolve, reject) => {
@@ -106,7 +106,9 @@ export class ClaudeSubprocess extends EventEmitter {
         // Use spawn() for security - no shell interpretation
         this.process = spawn("claude", args, {
           cwd: options.cwd || process.cwd(),
-          env: { ...process.env },
+          env: Object.fromEntries(
+            Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
+          ),
           stdio: ["pipe", "pipe", "pipe"],
         });
 
@@ -133,15 +135,20 @@ export class ClaudeSubprocess extends EventEmitter {
           }
         });
 
-        // Close stdin since we pass prompt as argument
+        // Pass prompt via stdin to avoid E2BIG on large inputs
+        this.process.stdin?.write(prompt);
         this.process.stdin?.end();
 
-        console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
+        if (process.env.DEBUG_SUBPROCESS) {
+          console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
+        }
 
         // Parse JSON stream from stdout
         this.process.stdout?.on("data", (chunk: Buffer) => {
           const data = chunk.toString();
-          console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
+          if (process.env.DEBUG_SUBPROCESS) {
+            console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
+          }
           this.buffer += data;
           this.processBuffer();
         });
@@ -152,13 +159,17 @@ export class ClaudeSubprocess extends EventEmitter {
           if (errorText) {
             // Don't emit as error unless it's actually an error
             // Claude CLI may write debug info to stderr
-            console.error("[Subprocess stderr]:", errorText.slice(0, 200));
+            if (process.env.DEBUG_SUBPROCESS) {
+              console.error("[Subprocess stderr]:", errorText.slice(0, 200));
+            }
           }
         });
 
         // Handle process close
         this.process.on("close", (code) => {
-          console.error(`[Subprocess] Process closed with code: ${code}`);
+          if (process.env.DEBUG_SUBPROCESS) {
+            console.error(`[Subprocess] Process closed with code: ${code}`);
+          }
           this.clearTimeout();
           // Process any remaining buffer
           if (this.buffer.trim()) {
@@ -179,7 +190,7 @@ export class ClaudeSubprocess extends EventEmitter {
   /**
    * Build CLI arguments array
    */
-  private buildArgs(prompt: string, options: SubprocessOptions): string[] {
+  private buildArgs(options: SubprocessOptions): string[] {
     const args = [
       "--print", // Non-interactive mode
       "--dangerously-skip-permissions", // Skip permission prompts
@@ -192,7 +203,7 @@ export class ClaudeSubprocess extends EventEmitter {
       "--no-session-persistence", // Don't save sessions
       "--append-system-prompt",
       OPENCLAW_TOOL_MAPPING_PROMPT,
-      prompt, // Pass prompt as argument (more reliable than stdin)
+      // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
 
     if (options.sessionId) {
