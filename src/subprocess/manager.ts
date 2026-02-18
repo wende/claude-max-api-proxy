@@ -90,13 +90,13 @@ export class ClaudeSubprocess extends EventEmitter {
    * Start the Claude CLI subprocess with the given prompt
    */
   async start(prompt: string, options: SubprocessOptions): Promise<void> {
-    const args = this.buildArgs(prompt, options);
+    const args = this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
-        this.process = spawn("claude", args, {
+        this.process = spawn(process.env.CLAUDE_BIN || "claude", args, {
           cwd: options.cwd || process.cwd(),
           env: { ...process.env },
           stdio: ["pipe", "pipe", "pipe"],
@@ -125,7 +125,8 @@ export class ClaudeSubprocess extends EventEmitter {
           }
         });
 
-        // Close stdin since we pass prompt as argument
+        // Write prompt via stdin, close after
+        this.process.stdin?.write(prompt);
         this.process.stdin?.end();
 
         console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
@@ -171,7 +172,7 @@ export class ClaudeSubprocess extends EventEmitter {
   /**
    * Build CLI arguments array
    */
-  private buildArgs(prompt: string, options: SubprocessOptions): string[] {
+  private buildArgs(options: SubprocessOptions): string[] {
     const args = [
       "--print", // Non-interactive mode
       "--dangerously-skip-permissions", // Skip permission prompts
@@ -184,7 +185,7 @@ export class ClaudeSubprocess extends EventEmitter {
       "--no-session-persistence", // Don't save sessions
       "--append-system-prompt",
       OPENCLAW_TOOL_MAPPING_PROMPT,
-      prompt, // Pass prompt as argument (more reliable than stdin)
+      // prompt is passed via stdin to handle long/complex content
     ];
 
     if (options.sessionId) {
@@ -258,7 +259,7 @@ export class ClaudeSubprocess extends EventEmitter {
  */
 export async function verifyClaude(): Promise<{ ok: boolean; error?: string; version?: string }> {
   return new Promise((resolve) => {
-    const proc = spawn("claude", ["--version"], { stdio: "pipe" });
+    const proc = spawn(process.env.CLAUDE_BIN || "claude", ["--version"], { stdio: "pipe" });
     let output = "";
 
     proc.stdout?.on("data", (chunk: Buffer) => {
