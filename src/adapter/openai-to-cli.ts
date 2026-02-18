@@ -13,18 +13,21 @@ export interface CliInput {
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
-  // Direct model names
+  // Direct model names (provider prefixes like `claude-code-cli/` and `claude-max/`
+  // are stripped by extractModel before consulting this map)
   "claude-opus-4": "opus",
+  "claude-opus-4-6": "opus",
   "claude-sonnet-4": "sonnet",
+  "claude-sonnet-4-5": "sonnet",
+  "claude-sonnet-4-6": "sonnet",
   "claude-haiku-4": "haiku",
-  // With provider prefix
-  "claude-code-cli/claude-opus-4": "opus",
-  "claude-code-cli/claude-sonnet-4": "sonnet",
-  "claude-code-cli/claude-haiku-4": "haiku",
-  // Aliases
+  "claude-haiku-4-5": "haiku",
+  // Bare aliases
   "opus": "opus",
   "sonnet": "sonnet",
   "haiku": "haiku",
+  "opus-max": "opus",
+  "sonnet-max": "sonnet",
 };
 
 /**
@@ -37,7 +40,7 @@ export function extractModel(model: string): ClaudeModel {
   }
 
   // Try stripping provider prefix
-  const stripped = model.replace(/^claude-code-cli\//, "");
+  const stripped = model.replace(/^(?:claude-code-cli|claude-max)\//, "");
   if (MODEL_MAP[stripped]) {
     return MODEL_MAP[stripped];
   }

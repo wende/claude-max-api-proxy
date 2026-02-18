@@ -85,6 +85,11 @@ export interface OpenAIChatChunk {
   created: number;
   model: string;
   choices: OpenAIChatChunkChoice[];
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
 }
 
 export interface OpenAIModel {

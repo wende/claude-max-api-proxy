@@ -240,11 +240,19 @@ async function handleStreamingResponse(
       lastModel = message.message.model;
     });
 
-    subprocess.on("result", (_result: ClaudeCliResult) => {
+    subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
       if (!res.writableEnded) {
-        // Send final done chunk with finish_reason
+        // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
+        if (result.usage) {
+          doneChunk.usage = {
+            prompt_tokens: result.usage.input_tokens || 0,
+            completion_tokens: result.usage.output_tokens || 0,
+            total_tokens:
+              (result.usage.input_tokens || 0) + (result.usage.output_tokens || 0),
+          };
+        }
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
@@ -376,28 +384,24 @@ async function handleNonStreamingResponse(
  * Returns available models
  */
 export function handleModels(_req: Request, res: Response): void {
+  const now = Math.floor(Date.now() / 1000);
+  const modelIds = [
+    "claude-opus-4",
+    "claude-opus-4-6",
+    "claude-sonnet-4",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-4",
+    "claude-haiku-4-5",
+  ];
   res.json({
     object: "list",
-    data: [
-      {
-        id: "claude-opus-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-sonnet-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-      {
-        id: "claude-haiku-4",
-        object: "model",
-        owned_by: "anthropic",
-        created: Math.floor(Date.now() / 1000),
-      },
-    ],
+    data: modelIds.map((id) => ({
+      id,
+      object: "model",
+      owned_by: "anthropic",
+      created: now,
+    })),
   });
 }
 
