@@ -1,3 +1,6 @@
+> ### ⚠️  Repo not actively maintained⚠️
+> ### Community PRs and active development on [wende/claude-max-api-proxy](https://github.com/wende/claude-max-api-proxy/)
+
 # Claude Code CLI Provider
 
 **Use your Claude Max subscription ($200/month) with any OpenAI-compatible client — no separate API costs!**
