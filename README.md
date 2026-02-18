@@ -1,8 +1,10 @@
-# Claude Code CLI Provider
+# Claude Max API Proxy
+
+> Actively maintained fork of [atalovesyou/claude-max-api-proxy](https://github.com/atalovesyou/claude-max-api-proxy) with OpenClaw integration, improved streaming, and expanded model support.
 
 **Use your Claude Max subscription ($200/month) with any OpenAI-compatible client — no separate API costs!**
 
-This provider wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compatible HTTP API, allowing tools like Clawdbot, Continue.dev, or any OpenAI-compatible client to use your Claude Max subscription instead of paying per-API-call.
+This proxy wraps the Claude Code CLI as a subprocess and exposes an OpenAI-compatible HTTP API, allowing tools like OpenClaw, Continue.dev, or any OpenAI-compatible client to use your Claude Max subscription instead of paying per-API-call.
 
 ## Why This Exists
 
@@ -10,18 +12,18 @@ This provider wraps the Claude Code CLI as a subprocess and exposes an OpenAI-co
 |----------|------|------------|
 | Claude API | ~$15/M input, ~$75/M output tokens | Pay per use |
 | Claude Max | $200/month flat | OAuth blocked for third-party API use |
-| **This Provider** | $0 extra (uses Max subscription) | Routes through CLI |
+| **This Proxy** | $0 extra (uses Max subscription) | Routes through CLI |
 
-Anthropic blocks OAuth tokens from being used directly with third-party API clients. However, the Claude Code CLI *can* use OAuth tokens. This provider bridges that gap by wrapping the CLI and exposing a standard API.
+Anthropic blocks OAuth tokens from being used directly with third-party API clients. However, the Claude Code CLI *can* use OAuth tokens. This proxy bridges that gap by wrapping the CLI and exposing a standard API.
 
 ## How It Works
 
 ```
-Your App (Clawdbot, etc.)
+Your App (OpenClaw, Continue.dev, etc.)
          ↓
     HTTP Request (OpenAI format)
          ↓
-   Claude Code CLI Provider (this project)
+   Claude Max API Proxy (this project)
          ↓
    Claude Code CLI (subprocess)
          ↓
@@ -36,11 +38,21 @@ Your App (Clawdbot, etc.)
 
 - **OpenAI-compatible API** — Works with any client that supports OpenAI's API format
 - **Streaming support** — Real-time token streaming via Server-Sent Events
-- **Multiple models** — Claude Opus, Sonnet, and Haiku
-- **Session management** — Maintains conversation context
+- **Multiple models** — Claude Opus, Sonnet, and Haiku with flexible model aliases
+- **OpenClaw integration** — Automatic tool name mapping and system prompt adaptation
+- **Content block handling** — Proper text block separators for multi-block responses
+- **Session management** — Maintains conversation context via session IDs
 - **Auto-start service** — Optional LaunchAgent for macOS
 - **Zero configuration** — Uses existing Claude CLI authentication
-- **Secure by design** — Uses spawn() to prevent shell injection
+- **Secure by design** — Uses `spawn()` to prevent shell injection
+
+## What's Different from the Original
+
+- **OpenClaw tool mapping** — Maps OpenClaw tool names (`exec`, `read`, `web_search`, etc.) to Claude Code equivalents (`Bash`, `Read`, `WebSearch`)
+- **System prompt stripping** — Removes OpenClaw-specific tooling sections that confuse the CLI
+- **Content block support** — Handles `input_text` content blocks and multi-block text separators
+- **Tool call types** — Full OpenAI tool call type definitions for streaming and non-streaming
+- **Improved streaming** — Better SSE handling with connection confirmation and client disconnect detection
 
 ## Prerequisites
 
@@ -55,8 +67,8 @@ Your App (Clawdbot, etc.)
 
 ```bash
 # Clone the repository
-git clone https://github.com/anthropics/claude-code-cli-provider.git
-cd claude-code-cli-provider
+git clone https://github.com/wende/claude-max-api-proxy.git
+cd claude-max-api-proxy
 
 # Install dependencies
 npm install
@@ -70,10 +82,16 @@ npm run build
 ### Start the server
 
 ```bash
+npm start
+# or
 node dist/server/standalone.js
 ```
 
-The server runs at `http://localhost:3456` by default.
+The server runs at `http://localhost:3456` by default. Pass a custom port as an argument:
+
+```bash
+node dist/server/standalone.js 8080
+```
 
 ### Test it
 
@@ -88,7 +106,7 @@ curl http://localhost:3456/v1/models
 curl -X POST http://localhost:3456/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-opus-4",
+    "model": "claude-sonnet-4",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 
@@ -96,7 +114,7 @@ curl -X POST http://localhost:3456/v1/chat/completions \
 curl -N -X POST http://localhost:3456/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-opus-4",
+    "model": "claude-sonnet-4",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -112,23 +130,19 @@ curl -N -X POST http://localhost:3456/v1/chat/completions \
 
 ## Available Models
 
-| Model ID | Maps To |
-|----------|---------|
-| `claude-opus-4` | Claude Opus 4.5 |
-| `claude-sonnet-4` | Claude Sonnet 4 |
-| `claude-haiku-4` | Claude Haiku 4 |
+| Model ID | Alias | CLI Model |
+|----------|-------|-----------|
+| `claude-opus-4` | `opus` | Claude Opus |
+| `claude-sonnet-4` | `sonnet` | Claude Sonnet |
+| `claude-haiku-4` | `haiku` | Claude Haiku |
+
+All model IDs also accept a `claude-code-cli/` prefix (e.g., `claude-code-cli/claude-opus-4`). Unknown models default to Opus.
 
 ## Configuration with Popular Tools
 
-### Clawdbot
+### OpenClaw
 
-Clawdbot has **built-in support** for Claude CLI OAuth! Check your config:
-
-```bash
-clawdbot models status
-```
-
-If you see `anthropic:claude-cli=OAuth`, you're already using your Max subscription.
+OpenClaw works with this proxy out of the box. The proxy automatically maps OpenClaw tool names to Claude Code equivalents and strips conflicting tooling sections from system prompts.
 
 ### Continue.dev
 
@@ -139,7 +153,7 @@ Add to your Continue config:
   "models": [{
     "title": "Claude (Max)",
     "provider": "openai",
-    "model": "claude-opus-4",
+    "model": "claude-sonnet-4",
     "apiBase": "http://localhost:3456/v1",
     "apiKey": "not-needed"
   }]
@@ -157,27 +171,43 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="claude-opus-4",
+    model="claude-sonnet-4",
     messages=[{"role": "user", "content": "Hello!"}]
 )
 ```
 
 ## Auto-Start on macOS
 
-Create a LaunchAgent to start the provider automatically on login. See `docs/macos-setup.md` for detailed instructions.
+The proxy can run as a macOS LaunchAgent on port 3456.
+
+**Plist location:** `~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist`
+
+```bash
+# Start the service
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openclaw.claude-max-proxy.plist
+
+# Restart
+launchctl kickstart -k gui/$(id -u)/com.openclaw.claude-max-proxy
+
+# Stop
+launchctl bootout gui/$(id -u)/com.openclaw.claude-max-proxy
+
+# Check status
+launchctl list com.openclaw.claude-max-proxy
+```
 
 ## Architecture
 
 ```
 src/
 ├── types/
-│   ├── claude-cli.ts      # Claude CLI JSON output types
-│   └── openai.ts          # OpenAI API types
+│   ├── claude-cli.ts      # Claude CLI JSON streaming types + type guards
+│   └── openai.ts          # OpenAI API types (including tool calls)
 ├── adapter/
 │   ├── openai-to-cli.ts   # Convert OpenAI requests → CLI format
 │   └── cli-to-openai.ts   # Convert CLI responses → OpenAI format
 ├── subprocess/
-│   └── manager.ts         # Claude CLI subprocess management
+│   └── manager.ts         # Claude CLI subprocess + OpenClaw tool mapping
 ├── session/
 │   └── manager.ts         # Session ID mapping
 ├── server/
@@ -190,19 +220,9 @@ src/
 ## Security
 
 - Uses Node.js `spawn()` instead of shell execution to prevent injection attacks
-- No API keys stored or transmitted by this provider
+- No API keys stored or transmitted by this proxy
 - All authentication handled by Claude CLI's secure keychain storage
 - Prompts passed as CLI arguments, not through shell interpretation
-
-## Cost Savings Example
-
-| Usage | API Cost | With This Provider |
-|-------|----------|-------------------|
-| 1M input tokens/month | ~$15 | $0 (included in Max) |
-| 500K output tokens/month | ~$37.50 | $0 (included in Max) |
-| **Monthly Total** | **~$52.50** | **$0 extra** |
-
-If you're already paying for Claude Max, this provider lets you use that subscription for API-style access at no additional cost.
 
 ## Troubleshooting
 
@@ -238,5 +258,6 @@ MIT
 
 ## Acknowledgments
 
-- Built for use with [Clawdbot](https://clawd.bot)
+- Originally created by [atalovesyou](https://github.com/atalovesyou/claude-max-api-proxy)
+- Built for use with [OpenClaw](https://openclaw.com)
 - Powered by [Claude Code CLI](https://github.com/anthropics/claude-code)
