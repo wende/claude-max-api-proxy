@@ -246,7 +246,7 @@ async function handleStreamingResponse(
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
         if (result.usage) {
-          (doneChunk as any).usage = {
+          doneChunk.usage = {
             prompt_tokens: result.usage.input_tokens || 0,
             completion_tokens: result.usage.output_tokens || 0,
             total_tokens:

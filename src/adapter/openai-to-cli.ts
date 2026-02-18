@@ -13,7 +13,8 @@ export interface CliInput {
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
-  // Direct model names
+  // Direct model names (provider prefixes like `claude-code-cli/` and `claude-max/`
+  // are stripped by extractModel before consulting this map)
   "claude-opus-4": "opus",
   "claude-opus-4-6": "opus",
   "claude-sonnet-4": "sonnet",
@@ -21,22 +22,6 @@ const MODEL_MAP: Record<string, ClaudeModel> = {
   "claude-sonnet-4-6": "sonnet",
   "claude-haiku-4": "haiku",
   "claude-haiku-4-5": "haiku",
-  // With provider prefix (claude-code-cli/)
-  "claude-code-cli/claude-opus-4": "opus",
-  "claude-code-cli/claude-opus-4-6": "opus",
-  "claude-code-cli/claude-sonnet-4": "sonnet",
-  "claude-code-cli/claude-sonnet-4-5": "sonnet",
-  "claude-code-cli/claude-sonnet-4-6": "sonnet",
-  "claude-code-cli/claude-haiku-4": "haiku",
-  "claude-code-cli/claude-haiku-4-5": "haiku",
-  // With provider prefix (claude-max/)
-  "claude-max/claude-opus-4": "opus",
-  "claude-max/claude-opus-4-6": "opus",
-  "claude-max/claude-sonnet-4": "sonnet",
-  "claude-max/claude-sonnet-4-5": "sonnet",
-  "claude-max/claude-sonnet-4-6": "sonnet",
-  "claude-max/claude-haiku-4": "haiku",
-  "claude-max/claude-haiku-4-5": "haiku",
   // Bare aliases
   "opus": "opus",
   "sonnet": "sonnet",
