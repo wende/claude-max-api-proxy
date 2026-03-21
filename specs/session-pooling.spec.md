@@ -1,4 +1,6 @@
-# Session Pooling — Spec (Tier 1) — Rev 2
+# Session Pooling — Spec (Tier 1) — Rev 3
+
+**Rev 3 (2026-03-21):** Addresses 7 new findings from second Opus sub-agent review. 3 major, 4 minor. All Rev 1 resolutions verified adequate.
 
 **Rev 2 (2026-03-21):** Addresses 14 findings from Opus sub-agent architectural review. 3 critical, 5 major, 6 minor. All resolved.
 
@@ -75,14 +77,17 @@ The production design locks each CLI process to a specific OpenClaw session key 
 
 3. SessionPoolRouter.execute(prompt, "opus", sessionKey):
    a) lockedSessions.has(sessionKey)?
-      YES + idle → write to stdin, mark busy
+      YES + idle → write to stdin, mark busy, start request timeout timer
       YES + busy → enqueue on process's requestQueue (max 3, reject with 429 if full)
-      NO  → warmPool["opus"].pop() → lock to sessionKey
-            if warmPool empty → spawn new process (3-10s cold start, one-time)
-            if MAX_TOTAL_PROCESSES reached → fall back to ClaudeSubprocess
+      YES + PENDING_SENTINEL → enqueue (claim in progress, will drain when ready)
+      NO  → set PENDING_SENTINEL in lockedSessions (synchronous, prevents race)
+            → warmPool["opus"].pop() → lock to sessionKey (replace sentinel)
+            if warmPool empty AND total processes < MAX_TOTAL_PROCESSES → spawn new process (3-10s cold start, one-time)
+            if warmPool empty AND total processes >= MAX_TOTAL_PROCESSES → delete sentinel, fall back to ClaudeSubprocess
 
 4. Write prompt to process stdin as stream-json message
 5. Read response from process stdout, emit events to caller
+   - If POOL_REQUEST_TIMEOUT_MS exceeded → treat as process death (kill, reject queue, respawn)
 6. Mark process idle, drain requestQueue if non-empty (next queued request starts)
 7. Process stays locked to sessionKey for future requests
 ```
@@ -109,6 +114,61 @@ Session resets generate a new session key. The old process is orphaned. Without 
 3. If found → that process is orphaned. If idle: kill immediately, respawn into warm pool. If busy: mark for reclamation after current request completes.
 
 This catches resets instantly without waiting for the nightly sweep.
+
+### Orphan Queue Rejection (Major — Finding N1)
+
+When a session reset triggers orphan reclamation (see "Orphan Reclamation" above), the orphaned process may have queued requests from the old session key. These requests belong to a dead session — the gateway has already moved on to a new session key.
+
+**Rule:** When a process is marked as orphaned:
+- If idle: kill immediately, respawn into warm pool
+- If busy with an active request: let the active request complete, then kill
+- **All queued requests on the orphaned process are rejected immediately with HTTP 503 + `Retry-After: 3`** — they belong to the dead session key. The gateway will retry with the new key, which will route to the new process.
+
+Do NOT drain queued requests on an orphaned process. The queue contents are stale — they were enqueued under a session key that no longer exists.
+
+### Per-Request Timeout (Major — Finding N2)
+
+If a CLI process hangs (stuck inference, deadlocked stdin/stdout pipe, unresponsive model), it stays in "busy" state indefinitely. The per-process queue fills to max depth, then all subsequent requests get 429'd. The nightly sweep skips busy processes. The session is permanently wedged.
+
+**Solution:** `POOL_REQUEST_TIMEOUT_MS` (default 300000 / 5 minutes).
+
+When a request has been in-flight longer than this threshold:
+1. Treat the process as dead — trigger the standard process death recovery flow
+2. The active request's emitter receives a timeout error
+3. Reject all queued requests with 503 + `Retry-After: 3`
+4. Remove the process from `lockedSessions`
+5. Spawn a replacement into the warm pool
+6. Log the timeout event with session key, PID, and elapsed time
+
+**Why 5 minutes:** The existing proxy has a 15-minute timeout for subprocess-per-request. Pooled processes should be tighter — a 5-minute inference is extremely unusual and likely indicates a hang. The model typically responds in 10-60 seconds. This is configurable via env var.
+
+### Atomic Pool Claim (Major — Finding N3)
+
+Two simultaneous requests for the same *new* session key can race: both check `lockedSessions.has(key)` → false, both attempt to claim from the warm pool. One overwrites the other's lock, orphaning a process with no lineage reclamation.
+
+Node.js is single-threaded, but the `execute()` path has async yield points (cold spawn with `await`). Between the `has()` check and the lock write, another request can enter the same path.
+
+**Solution:** Set a pending-lock sentinel immediately (synchronously) on first touch:
+
+```
+execute(prompt, model, sessionKey):
+  if lockedSessions.has(sessionKey):
+    // route to existing locked process (or queue)
+  else:
+    // SYNCHRONOUS: set sentinel before any async work
+    lockedSessions.set(sessionKey, PENDING_SENTINEL)
+    try:
+      process = warmPool[model].pop() ?? await spawnCold(model)
+      lockedSessions.set(sessionKey, process)  // replace sentinel with real process
+    catch:
+      lockedSessions.delete(sessionKey)  // clean up sentinel on failure
+      throw
+
+  // Second request for same key hits the `has()` check → true → queues on the sentinel
+  // When sentinel is replaced with real process, queued requests are drained
+```
+
+The `PENDING_SENTINEL` is a special marker that causes incoming requests for that key to enqueue (same as a busy process). When the real process is assigned, the queue drains.
 
 ### Context Accumulation Threshold (Critical — Finding #3)
 
@@ -205,17 +265,21 @@ This is simpler than a dynamic flex zone and maintains the invariant that model 
 - If the warm pool is empty and no process is available, the proxy spawns a cold subprocess (same as current behavior). It NEVER fails a request due to pool exhaustion — it degrades to cold-start or subprocess fallback.
 - Total process count (locked + warm) must not exceed `MAX_TOTAL_PROCESSES` (default 30). Beyond this, new requests fall back to `ClaudeSubprocess`.
 - The production port (3456) and health endpoint format remain unchanged. Existing OpenClaw provider config works without modification.
-- `ClaudeSubprocess` (subprocess-per-request) is retained in the codebase as fallback for unknown models and headerless requests.
+- `ClaudeSubprocess` (subprocess-per-request) is retained in the codebase as fallback for unknown models and headerless requests. Fallback subprocesses are NOT counted against `MAX_TOTAL_PROCESSES` — they are short-lived (die after one request) and self-limiting.
 - The nightly sweep runs at 3:00 AM America/New_York (DST-aware), not UTC.
+- Pool claim for a new session key is atomic: a `PENDING_SENTINEL` is set synchronously before any async work. No two requests for the same new key can both claim a process.
+- Every in-flight request has a timeout (`POOL_REQUEST_TIMEOUT_MS`). A hung process is treated as dead and recovered automatically.
 
 ## Forbidden Patterns
 
 - **No cross-session routing:** A process locked to session A must never serve session B, even if A is idle and B is queued. Claim a new process instead.
 - **No model mixing within a process:** A process spawned with `--model opus` must never receive a sonnet request. Model is baked at spawn time.
-- **No eager recycling of active sessions:** The sweep recycles only processes idle > 2 hours OR exceeding the request count threshold. A process that served a request 30 minutes ago stays locked, even during the 3 AM sweep (unless it's over the request count limit).
+- **No eager recycling of active sessions:** The sweep recycles only processes idle > 2 hours OR exceeding the request count threshold. A process that served a request 30 minutes ago stays locked, even during the 3 AM sweep (unless it's over the request count limit). **Clarification:** The inline `requestCount > 50` recycling (in "Context Accumulation Threshold") is not eager recycling — it triggers only after a request completes and only when the queue is empty. It is a safety valve, not a sweep.
 - **No shared mutable state between pool and routes:** The router exposes `execute()`, `stats()`, and `sweep()` only. Routes do not directly manipulate pool internals.
 - **No removal of the existing subprocess manager:** `ClaudeSubprocess` stays for fallback and backward compatibility.
 - **No concurrent writes to a process's stdin:** The per-process request queue serializes all writes. Any code path that bypasses the queue is a critical bug.
+- **No draining queued requests on orphaned processes:** When lineage reclamation marks a process as orphaned, queued requests are rejected (503), not drained. They belong to a dead session key.
+- **No pool claim without sentinel:** The `lockedSessions.set(key, PENDING_SENTINEL)` must execute synchronously before any `await`. Skipping the sentinel creates a race condition between concurrent requests for the same new key.
 
 ## Modules
 
@@ -237,6 +301,9 @@ This is simpler than a dynamic flex zone and maintains the invariant that model 
 - Nightly sweep logic (idle > 2 hours OR requestCount > 50 → recycle → refill)
 - Process health monitoring: auto-respawn on unexpected death with atomic `lockedSessions` cleanup
 - Auth error detection: treat auth failures as process death, trigger recovery flow
+- Per-request timeout (`POOL_REQUEST_TIMEOUT_MS`): hung processes treated as dead, triggers recovery
+- Atomic pool claim via `PENDING_SENTINEL`: prevents race condition on simultaneous new-key requests
+- Orphan queue rejection: queued requests on orphaned processes are rejected (503), not drained
 
 **Acceptance Criteria:**
 - [ ] Requests with the same `x-openclaw-session-key` always route to the same process
@@ -255,6 +322,10 @@ This is simpler than a dynamic flex zone and maintains the invariant that model 
 - [ ] Sweep refills warm pool to configured size after recycling (respecting `MAX_TOTAL_PROCESSES`)
 - [ ] Process death triggers atomic cleanup: remove from `lockedSessions`, reject queued requests with 503, spawn replacement
 - [ ] Auth errors (exit code + error message matching) trigger process death recovery
+- [ ] Request timeout (`POOL_REQUEST_TIMEOUT_MS`) kills hung process and triggers death recovery
+- [ ] Orphan reclamation rejects queued requests on the orphaned process with 503 (does not drain them)
+- [ ] Two simultaneous requests for the same new session key do not both claim a process — second request queues behind the pending sentinel
+- [ ] `agentChannel` extraction validates session key format and falls back to full key if format is unexpected
 - [ ] Graceful shutdown kills all processes and drains/rejects queued requests
 
 ### Module 2: Route Integration (`src/server/routes.ts`)
@@ -296,6 +367,7 @@ This is simpler than a dynamic flex zone and maintains the invariant that model 
   - `SWEEP_HOUR` (default 3) — hour in ET for nightly sweep
   - `SWEEP_IDLE_THRESHOLD_MS` (default 7200000) — idle time before sweep recycles
   - `POOL_REQUEST_QUEUE_DEPTH` (default 3) — per-process queue depth
+  - `POOL_REQUEST_TIMEOUT_MS` (default 300000) — per-request timeout; hung process treated as dead
 - Graceful shutdown integration (SIGTERM/SIGINT)
 
 **Acceptance Criteria:**
@@ -330,7 +402,7 @@ What "done" looks like — these must be verified by someone other than the buil
 
 1. **Functional:** Send 5 requests from different session keys → each gets a dedicated process. Send a 6th from a key that already has a process → routed to the existing one (verify via logs or health endpoint).
 2. **Serialization:** Send 2 rapid requests on the same session key → both succeed, responses are correct and not interleaved. Verify via log timestamps that the second waited for the first.
-3. **Backpressure:** Send 5 rapid requests on the same session key (queue depth 3) → first executes, 3 queue, 5th returns 429.
+3. **Backpressure:** Send 5 rapid requests on the same session key (queue depth 3) → first executes, next 3 queue, 5th returns 429.
 4. **Concurrency:** Send 3 simultaneous requests from different keys → all served in parallel with no queueing.
 5. **Cold start:** Send a request after all warm processes are claimed → new process spawned, request succeeds, latency logged.
 6. **Overflow cap:** Fill the pool to `MAX_TOTAL_PROCESSES`, send another request with a new session key → falls back to `ClaudeSubprocess`, still succeeds.
@@ -342,8 +414,11 @@ What "done" looks like — these must be verified by someone other than the buil
 12. **Context degradation:** Send 60 requests through the same locked process → verify the process is recycled after request 50 (on next idle). Verify subsequent request gets a fresh process.
 13. **Backward compat:** Send a request without `x-openclaw-session-key` header → falls back to subprocess-per-request. No error.
 14. **Unknown model:** Send a request with session key + model "haiku" → falls back to `ClaudeSubprocess`. No error.
-15. **Health:** `/health` endpoint returns pool stats including locked/warm/busy/queued/orphansReclaimed counts.
-16. **Build:** `npm run build` succeeds with no errors or warnings.
+15. **Health:** `/health` endpoint returns pool stats including locked/warm/busy/queued/orphansReclaimed counts. Stats include aggregate route-hit counters: locked, warm, cold, fallback.
+16. **Request timeout:** Simulate a hung process (e.g., suspend with SIGSTOP). Verify request times out after `POOL_REQUEST_TIMEOUT_MS`, process is killed and replaced, queued requests rejected with 503.
+17. **Atomic claim:** Send 2 simultaneous requests for the same new session key → only one process claimed, second request queued and served after the first completes.
+18. **Orphan queue rejection:** Enqueue 2 requests on a locked process, then trigger a session reset. Verify queued requests receive 503 (not drained through the orphaned process).
+19. **Build:** `npm run build` succeeds with no errors or warnings.
 
 ## Observability (Finding #12)
 
@@ -383,6 +458,8 @@ Pool lifecycle events (spawn, recycle, death, orphan-reclaim, sweep) are also lo
     "orphansReclaimed": 3,
     "totalRequests": 142,
     "processRecycles": 5,
+    "requestTimeouts": 0,
+    "routeHits": { "locked": 98, "warm": 32, "cold": 8, "fallback": 4 },
     "uptime": 43200
   }
 }
@@ -401,12 +478,16 @@ Pool lifecycle events (spawn, recycle, death, orphan-reclaim, sweep) are also lo
 | 2026-03-21 | Lineage-based orphan reclamation | **Rev 2 — Finding #2.** Session resets orphan processes. Without immediate reclamation, 20+ resets/day = 20+ leaked processes until 3 AM. Lineage key (agent+channel) detects orphans on the spot. | Wait for 3 AM sweep (unacceptable leak rate). Timer-based idle reclamation (adds complexity, doesn't catch rapid resets). |
 | 2026-03-21 | Request count threshold (50) for recycling | **Rev 2 — Finding #3.** CLI accumulates context from every request. 50 requests ≈ 100-200K tokens of noise. Recycling at this threshold prevents context window overflow while staying well within safe bounds for a day's active session. | No threshold, rely on manual resets only (risky for agents that never reset). Lower threshold like 20 (too aggressive, causes unnecessary cold starts). |
 | 2026-03-21 | MAX_TOTAL_PROCESSES cap (30) | **Rev 2 — Finding #12.** Prevents runaway process spawning from consuming all system memory. 30 processes × 200MB = 6GB worst case — well within 128GB. Beyond 30, requests fall back to ClaudeSubprocess. | No cap (dangerous). Per-model cap only (doesn't prevent total runaway). |
+| 2026-03-21 | Reject (not drain) queued requests on orphaned processes | **Rev 3 — Finding N1.** Queued requests belong to the dead session key. Draining them serves stale requests and delays the process kill. Rejecting with 503 lets the gateway retry with the new key. | Drain queue first (serves stale-session requests, delays reclamation). |
+| 2026-03-21 | Per-request timeout (5 min default) | **Rev 3 — Finding N2.** Without a timeout, a hung CLI process permanently wedges a session. 5 min is generous for inference (typical: 10-60s) but catches real hangs. Triggers standard death recovery. | No timeout (process stays busy forever). 15-min matching old proxy (too long for pooled — blocks the session). |
+| 2026-03-21 | PENDING_SENTINEL for atomic pool claim | **Rev 3 — Finding N3.** Async yield points between `has()` and `set()` create a window for duplicate claims. Synchronous sentinel closes the window. Second request queues instead of claiming. | Mutex/lock (overkill for single-threaded Node). Accept the race (orphans a process silently). |
 
 ## Review History
 
 | Rev | Date | Reviewer | Findings | Status |
 |-----|------|----------|----------|--------|
 | 1 | 2026-03-21 | Opus sub-agent | 14 (3C/5M/6m) | All resolved in Rev 2 |
+| 2 | 2026-03-21 | Opus sub-agent | 7 (0C/3M/4m) | All resolved in Rev 3 |
 
 ### Finding Resolution Index
 
@@ -426,6 +507,13 @@ Pool lifecycle events (spawn, recycle, death, orphan-reclaim, sweep) are also lo
 | 12 | MINOR | Prototype cleanup should be separate commit | Module 4 now specifies separate commit. |
 | 13 | MINOR | No logging/observability spec | Added "Observability" section with structured logging and health endpoint schemas. |
 | 14 | MINOR | Pool size conflates warm vs. total | Added `MAX_TOTAL_PROCESSES` (default 30) as hard cap distinct from per-model warm targets. |
+| N1 | MAJOR | Orphan reclamation races with in-flight queue | Queued requests on orphaned processes are rejected (503), not drained. They belong to the dead session. See "Orphan Queue Rejection" section. |
+| N2 | MAJOR | No per-request timeout for hung processes | `POOL_REQUEST_TIMEOUT_MS` (default 300000). Timeout triggers process death recovery. See "Per-Request Timeout" section. |
+| N3 | MAJOR | Pool claim not atomic — race on new session key | `PENDING_SENTINEL` set synchronously before async work. See "Atomic Pool Claim" section. |
+| N4 | MINOR | `agentChannel` extraction assumes fixed key format | Validation added — falls back to full session key if format is unexpected. AC added to Module 1. |
+| N5 | MINOR | Off-by-one in backpressure validation criterion | Fixed wording: "first executes, next 3 queue, 5th returns 429." |
+| N6 | MINOR | ClaudeSubprocess fallback not counted in MAX_TOTAL_PROCESSES | Documented as intentional — fallback processes are short-lived and self-limiting. |
+| N7 | MINOR | No aggregate route-hit counters in stats() | Added `routeHits: { locked, warm, cold, fallback }` to health endpoint. |
 
 ## Pre-Change Impact Statement
 
