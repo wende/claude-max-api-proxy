@@ -1,4 +1,6 @@
-# Session Pooling — Spec (Tier 1) — Rev 4
+# Session Pooling — Spec (Tier 1) — Rev 5
+
+**Rev 5 (2026-03-21):** Addresses 4 findings from fourth Opus sub-agent review. 1 major, 3 minor. All prior resolutions verified adequate.
 
 **Rev 4 (2026-03-21):** Addresses 7 findings from third Opus sub-agent review. 3 major, 4 minor. All prior resolutions verified adequate.
 
@@ -187,7 +189,9 @@ execute(prompt, model, sessionKey):
   // When sentinel is replaced with real process, queued requests are drained
 ```
 
-The `PENDING_SENTINEL` is a special marker that causes incoming requests for that key to enqueue (same as a busy process). When the real process is assigned, the queue drains.
+The `PENDING_SENTINEL` is a special marker that causes incoming requests for that key to enqueue. When the real process is assigned, the queue drains.
+
+**Implementation note (Finding N16):** `lockedSessions` is typed `Map<string, PooledProcess>`, but the sentinel is not a real `PooledProcess`. Implement the sentinel as a lightweight object with `{ isPending: true, requestQueue: PendingRequest[] }` — it has a queue (where requests accumulate while the real process is being claimed/spawned) but no actual CLI process. When the real process is assigned, transfer the sentinel's `requestQueue` to the new `PooledProcess` and drain it. The router checks `isPending` to distinguish sentinels from real processes. Type the map as `Map<string, PooledProcess | PendingSentinel>` or use a discriminated union.
 
 ### Failed Cold Spawn Recovery (Major — Finding N9)
 
@@ -212,8 +216,8 @@ catch (error):
 Each request adds its full prompt to the CLI's accumulated context. After 50 requests, the CLI could have 500K+ tokens of accumulated noise, risking context window overflow and degraded responses.
 
 **Rule:** When a process completes a request and `requestCount > 50`:
-- If `requestQueue` is empty → recycle immediately (kill, respawn fresh into warm pool, clear the session lock — next request from this key claims a new process)
-- If `requestQueue` is non-empty → drain the queue first, then recycle when empty
+- If `requestQueue` is empty → recycle immediately: call `clearSessionLock()`, kill process, respawn into warm pool. Next request from this key claims a new process.
+- If `requestQueue` is non-empty → set state to `"recycling"` (prevents new requests from being enqueued by sweep or new arrivals — they get a fresh process instead). Drain the existing queue normally. When queue empties, THEN call `clearSessionLock()`, kill, respawn. **Important (Finding N17):** `clearSessionLock()` resets `requestCount` to 0, so it must be called AFTER the drain-then-recycle decision, not before. The `"recycling"` state is the guard — it signals that this process is committed to being recycled regardless of the counter.
 
 The threshold is configurable via `POOL_MAX_REQUESTS_PER_PROCESS` (default 50).
 
@@ -280,12 +284,29 @@ Long-lived CLI processes (up to 24 hours between sweeps) may outlive their auth 
 
 **No preemptive refresh needed.** The Claude CLI handles token refresh internally for most cases. This catch handles the edge case where it doesn't.
 
-### Unknown Model Routing (Major — Finding #8)
+### Unknown Model Routing (Major — Finding #8, updated Finding N15)
 
-If a request has a valid `x-openclaw-session-key` but requests a model not in any pool (e.g., `haiku`):
-- **Do not attempt pooled routing** — there's no pool for that model
-- Fall back to `ClaudeSubprocess` (subprocess-per-request)
-- Log the model name for tracking — if it appears frequently, consider adding a pool
+The existing `extractModel()` in `openai-to-cli.ts` normalizes model strings: it maps known names to `ClaudeModel` values (`"opus" | "sonnet" | "haiku"`) and defaults unrecognized strings to `"opus"`. This means truly unknown model strings (e.g., `"gpt-4"`) silently become `"opus"` and will route to the opus pool — the "unknown model" fallback path is unreachable via the adapter.
+
+**The router must check against the set of pooled models, not rely on type-level unknowns:**
+
+```
+const POOLED_MODELS = new Set(["opus", "sonnet"]);  // models that have warm pools
+
+if (POOLED_MODELS.has(resolvedModel)):
+  // route through SessionPoolRouter
+else:
+  // fall back to ClaudeSubprocess (e.g., haiku)
+```
+
+This correctly handles:
+- `haiku` — a valid `ClaudeModel` but not pooled → falls back to `ClaudeSubprocess`
+- Truly unknown strings — already mapped to `"opus"` by `extractModel()` → routes to opus pool (correct, since the CLI will run opus on the Max subscription regardless)
+- Future models — add to `POOLED_MODELS` when a pool is created, otherwise they fall back
+
+**Do not modify `extractModel()`** — its defaulting behavior is correct for the CLI (which needs a valid model name). The pooling decision is a separate layer.
+
+Log any non-pooled model name for tracking — if haiku or a future model appears frequently, consider adding a pool.
 
 ### Model Pool Flex Zone (Major — Finding #5)
 
@@ -434,9 +455,10 @@ When `MAX_TOTAL_PROCESSES` is reached, new session-keyed requests fall back to `
 - Graceful shutdown integration (SIGTERM/SIGINT):
   1. **Immediately** close the listening socket (stop accepting new connections — Finding N12)
   2. Wait for in-flight requests to complete (30s timeout)
-  3. Reject all queued requests with 503
-  4. Kill all pool processes
-  5. Exit
+  3. Call `SessionPoolRouter.shutdown()` — rejects all queued requests with 503, kills all pool processes
+  4. Exit
+
+  **Implementation note (Finding N18):** `standalone.ts` should handle the full shutdown sequence directly rather than delegating to the existing `stopServer()` in `index.ts`. The current `stopServer()` has no pool awareness. The standalone entry point owns both the HTTP server and the pool router, so it is the natural place for the coordinated shutdown: `server.close()` (step 1), then timeout (step 2), then `router.shutdown()` (step 3), then `process.exit()` (step 4).
 
 **Acceptance Criteria:**
 - [ ] Pool initializes with configured sizes on server start
@@ -557,6 +579,8 @@ Pool lifecycle events (spawn, recycle, death, orphan-reclaim, sweep) are also lo
 | 2026-03-21 | Canonical clearSessionLock() method | **Rev 4 — Finding N8.** Six different flows clear session locks with inconsistent cleanup. Single method prevents stale artifacts (dangling lockedTo, leftover lineage keys). | Inline cleanup per flow (error-prone, already caused inconsistency). |
 | 2026-03-21 | Reject queued requests on failed cold spawn | **Rev 4 — Finding N9.** Sentinel deletion without queue drain leaves waiters hanging forever. Explicit rejection before deletion ensures no orphaned promises. | Let waiters timeout naturally (up to 5 min hang per request). |
 | 2026-03-21 | Document fallback serialization loss as known degradation | **Rev 4 — Finding N10.** Adding serialization to ClaudeSubprocess fallback adds complexity to a safety valve that shouldn't be hit often. If it's hit often, increase the cap. | Add fallback serialization (complexity for a rare path). |
+| 2026-03-21 | Route by POOLED_MODELS set, not type system | **Rev 5 — Finding N15.** `extractModel()` defaults unknowns to "opus" — the type system can't distinguish pooled from non-pooled. Explicit set check is the correct routing mechanism. | Modify extractModel to return null (breaks existing callers). |
+| 2026-03-21 | Standalone.ts owns shutdown sequence | **Rev 5 — Finding N18.** The server module has no pool awareness. Rather than threading the router through `startServer`/`stopServer`, let the entry point coordinate both. | Thread router into index.ts (unnecessary coupling). |
 
 ## Review History
 
@@ -565,6 +589,7 @@ Pool lifecycle events (spawn, recycle, death, orphan-reclaim, sweep) are also lo
 | 1 | 2026-03-21 | Opus sub-agent | 14 (3C/5M/6m) | All resolved in Rev 2 |
 | 2 | 2026-03-21 | Opus sub-agent | 7 (0C/3M/4m) | All resolved in Rev 3 |
 | 3 | 2026-03-21 | Opus sub-agent | 7 (0C/3M/4m) | All resolved in Rev 4 |
+| 4 | 2026-03-21 | Opus sub-agent | 4 (0C/1M/3m) | All resolved in Rev 5 |
 
 ### Finding Resolution Index
 
@@ -598,6 +623,10 @@ Pool lifecycle events (spawn, recycle, death, orphan-reclaim, sweep) are also lo
 | N12 | MINOR | Shutdown doesn't specify when to stop accepting connections | Close listening socket immediately on SIGTERM. Updated in Module 3. |
 | N13 | MINOR | Health endpoint missing locked counts per model | Added `locked: { total, opus, sonnet }` to health endpoint. |
 | N14 | MINOR | Sweep could double-kill a process mid-inline-recycle | Sweep skips processes in `recycling` state. Updated in "Nightly Sweep" section. |
+| N15 | MAJOR | `extractModel` defaults unknowns to "opus", defeating unknown-model fallback | Router checks against `POOLED_MODELS` set, not type-level unknowns. `extractModel` unchanged. See updated "Unknown Model Routing" section. |
+| N16 | MINOR | PENDING_SENTINEL has no queue data structure | Sentinel is a `{ isPending: true, requestQueue: [] }` object. Queue transfers to real process on claim. See updated "Atomic Pool Claim" section. |
+| N17 | MINOR | `clearSessionLock` resets requestCount before drain completes | Drain-then-recycle sets `"recycling"` state first, calls `clearSessionLock` only after drain completes. See updated "Context Accumulation Threshold" section. |
+| N18 | MINOR | Shutdown has no mechanism to access pool from server module | `standalone.ts` owns the full shutdown sequence directly. See updated Module 3. |
 
 ## Pre-Change Impact Statement
 
