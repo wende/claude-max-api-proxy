@@ -70,9 +70,7 @@ export async function handleChatCompletions(
     }
 
     const cliInput = openaiToCli(body);
-    const sessionKey = req.headers["x-openclaw-session-key"] as
-      | string
-      | undefined;
+    const sessionKey = (req.headers["x-openclaw-session-key"] as string | undefined) || cliInput.sessionId;
     const agentId = req.headers["x-openclaw-agent-id"] as string | undefined;
 
     // --- Pool routing ---
