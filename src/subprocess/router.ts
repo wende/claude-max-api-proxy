@@ -10,6 +10,46 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
+
+/**
+ * Attaches a permanent no-op error listener so the emitter never reaches a
+ * zero-listener state.  Prevents Node's default throw behavior when callers
+ * detach their listeners before an async error fires.
+ * Uses a simple counter instead of listenerCount() to avoid zombie emitter crashes.
+ */
+function safeEmitter<T extends EventEmitter>(emitter: T): T {
+  let activeListeners = 0;
+  
+  // Track when listeners are added/removed
+  const originalOn = emitter.on.bind(emitter);
+  const originalOff = emitter.off.bind(emitter);
+  const originalRemoveListener = emitter.removeListener.bind(emitter);
+  
+  emitter.on = function(type: string, listener: (...args: any[]) => void) {
+    if (type === "error") activeListeners++;
+    return originalOn(type, listener);
+  };
+  
+  emitter.off = function(type: string, listener: (...args: any[]) => void) {
+    if (type === "error") activeListeners = Math.max(0, activeListeners - 1);
+    return originalOff(type, listener);
+  };
+  
+  emitter.removeListener = function(type: string, listener: (...args: any[]) => void) {
+    if (type === "error") activeListeners = Math.max(0, activeListeners - 1);
+    return originalRemoveListener(type, listener);
+  };
+  
+  // Permanent guard listener that logs if no other listeners
+  emitter.prependListener("error", function safeEmitGuard(err: Error) {
+    if (activeListeners <= 1) { // Only our guard listener
+      console.error("[Router] Suppressed error (no active listeners):", err.message);
+    }
+  });
+  
+  return emitter;
+}
+
 import type {
   ClaudeCliMessage,
   ClaudeCliStreamEvent,
@@ -210,12 +250,12 @@ export class SessionPoolRouter {
     sessionKey: string
   ): ExecuteResult | null {
     if (this.shuttingDown) {
-      const emitter = new EventEmitter();
+      const emitter = safeEmitter(new EventEmitter());
       process.nextTick(() => {
-        if (emitter.listenerCount("error") > 0) {
+        try {
           emitter.emit("error", new Error("Server is shutting down"));
-        } else {
-          console.error(`[Router] Suppressed shutdown error (no listeners)`);
+        } catch (err) {
+          console.error(`[Router] Suppressed shutdown error:`, (err as Error).message);
         }
       });
       return { emitter, routeType: "fallback", pid: null, queueDepth: 0 };
@@ -296,7 +336,7 @@ export class SessionPoolRouter {
     }
 
     // Cold spawn (async)
-    const emitter = new EventEmitter();
+    const emitter = safeEmitter(new EventEmitter());
     this.totalRequests++;
     this.routeHits.cold++;
 
@@ -319,10 +359,10 @@ export class SessionPoolRouter {
         );
         this.rejectSentinelQueue(sentinel, 503, "Cold spawn failed");
         this.clearSessionLock(sessionKey, null);
-        if (emitter.listenerCount("error") > 0) {
+        try {
           emitter.emit("error", new Error(`Cold spawn failed: ${err}`));
-        } else {
-          console.error(`[Router] Suppressed cold spawn error (no listeners):`, err.message);
+        } catch (emitErr) {
+          console.error(`[Router] Failed to emit cold spawn error:`, (emitErr as Error).message);
         }
       });
 
@@ -442,10 +482,10 @@ export class SessionPoolRouter {
     child.on("error", (err) => {
       console.error(`[Router:${id}] Process error:`, err.message);
       if (pooled.currentEmitter) {
-        if (pooled.currentEmitter.listenerCount("error") > 0) {
+        try {
           pooled.currentEmitter.emit("error", err);
-        } else {
-          console.error(`[Router:${pooled.id}] Suppressed error (no listeners):`, err.message);
+        } catch (emitErr) {
+          console.error(`[Router] Failed to emit process error:`, (emitErr as Error).message);
         }
         pooled.currentEmitter = null;
       }
@@ -531,7 +571,7 @@ export class SessionPoolRouter {
     prompt: string,
     routeType: "locked" | "warm" | "cold"
   ): ExecuteResult {
-    const emitter = new EventEmitter();
+    const emitter = safeEmitter(new EventEmitter());
     this.assignToProcess(proc, prompt, emitter);
     return {
       emitter,
@@ -647,16 +687,12 @@ export class SessionPoolRouter {
       this.requestTimeouts++;
 
       if (pooled.currentEmitter) {
-        if (pooled.currentEmitter.listenerCount("error") > 0) {
-          pooled.currentEmitter.emit(
-            "error",
-            new Error(
-              `Request timed out after ${this.config.requestTimeoutMs}ms`
-            )
-          );
-        } else {
-          console.error(`[Router:${pooled.id}] Suppressed error (no listeners): Request timed out after ${this.config.requestTimeoutMs}ms`);
-        }
+        pooled.currentEmitter.emit(
+          "error",
+          new Error(
+            `Request timed out after ${this.config.requestTimeoutMs}ms`
+          )
+        );
         pooled.currentEmitter = null;
       }
 
@@ -700,7 +736,7 @@ export class SessionPoolRouter {
     }
 
     if (proc.requestQueue.length >= this.config.requestQueueDepth) {
-      const emitter = new EventEmitter();
+      const emitter = safeEmitter(new EventEmitter());
       process.nextTick(() =>
         emitter.emit(
           "error",
@@ -718,7 +754,7 @@ export class SessionPoolRouter {
       };
     }
 
-    const emitter = new EventEmitter();
+    const emitter = safeEmitter(new EventEmitter());
     const pending: PendingRequest = {
       prompt,
       emitter,
@@ -741,7 +777,7 @@ export class SessionPoolRouter {
     _sessionKey: string
   ): ExecuteResult | null {
     if (sentinel.requestQueue.length >= this.config.requestQueueDepth) {
-      const emitter = new EventEmitter();
+      const emitter = safeEmitter(new EventEmitter());
       process.nextTick(() =>
         emitter.emit(
           "error",
@@ -759,7 +795,7 @@ export class SessionPoolRouter {
       };
     }
 
-    const emitter = new EventEmitter();
+    const emitter = safeEmitter(new EventEmitter());
     sentinel.requestQueue.push({ prompt, emitter, resolve: () => {} });
 
     return {
@@ -908,13 +944,13 @@ export class SessionPoolRouter {
     this.clearRequestTimeout(pooled);
 
     if (pooled.currentEmitter) {
-      if (pooled.currentEmitter.listenerCount("error") > 0) {
+      try {
         pooled.currentEmitter.emit(
           "error",
           new Error(`Pool process ${pooled.id} died with code ${code}`)
         );
-      } else {
-        console.error(`[Router:${pooled.id}] Suppressed error (no listeners): Pool process ${pooled.id} died with code ${code}`);
+      } catch (emitErr) {
+        console.error(`[Router] Failed to emit process death error:`, (emitErr as Error).message);
       }
       pooled.currentEmitter = null;
     }
@@ -1121,14 +1157,10 @@ export class SessionPoolRouter {
     for (const pooled of this.allProcesses.values()) {
       this.clearRequestTimeout(pooled);
       if (pooled.currentEmitter) {
-        if (pooled.currentEmitter.listenerCount("error") > 0) {
-          pooled.currentEmitter.emit(
-            "error",
-            new Error("Server shutting down")
-          );
-        } else {
-          console.error(`[Router:${pooled.id}] Suppressed error (no listeners): Server shutting down`);
-        }
+        pooled.currentEmitter.emit(
+          "error",
+          new Error("Server shutting down")
+        );
         pooled.currentEmitter = null;
       }
       kills.push(
