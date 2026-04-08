@@ -172,6 +172,16 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
+process.on("unhandledRejection", (reason: unknown) => {
+  console.error("[FATAL] Unhandled promise rejection:", reason);
+  process.exit(1);
+});
+
+process.on("uncaughtException", (err: Error) => {
+  console.error("[FATAL] Uncaught exception:", err);
+  process.exit(1);
+});
+
 main().catch((err) => {
   console.error("Unexpected error:", err);
   process.exit(1);
