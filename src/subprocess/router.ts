@@ -620,6 +620,9 @@ export class SessionPoolRouter {
     this.clearRequestTimeout(proc);
     proc.currentEmitter = null;
     this.rejectProcessQueue(proc);
+    // Clear the session lock BEFORE kill so the next request gets a fresh
+    // warm process instead of enqueuing behind the dead one.
+    this.clearSessionLock(sessionKey, proc);
     this.killAndRespawn(proc);
   }
 
