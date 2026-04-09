@@ -596,6 +596,33 @@ export class SessionPoolRouter {
     this.startRequestTimeout(pooled);
   }
 
+  /**
+   * Called by routes.ts when the gateway client disconnects before the CLI
+   * finishes responding. Releases the process so it can serve new requests
+   * instead of staying "busy" with a response nobody is consuming.
+   */
+  public cancelRequest(sessionKey: string): void {
+    const proc = this.lockedSessions.get(sessionKey);
+    if (!proc || isPendingSentinel(proc)) return;
+    if (proc.state !== "busy") return;
+
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      event: "request_cancelled",
+      processId: proc.id,
+      pid: proc.process.pid,
+      sessionKey,
+      reason: "client_disconnect",
+    }));
+
+    // Kill and respawn — the CLI process may be mid-response with buffered
+    // output that we can't cleanly drain. Safest to start fresh.
+    this.clearRequestTimeout(proc);
+    proc.currentEmitter = null;
+    this.rejectProcessQueue(proc);
+    this.killAndRespawn(proc);
+  }
+
   private releaseProcess(pooled: PooledProcess): void {
     this.clearRequestTimeout(pooled);
     pooled.currentEmitter = null;

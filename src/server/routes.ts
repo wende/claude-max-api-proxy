@@ -324,8 +324,8 @@ async function handlePooledStreaming(
       resolve();
     };
 
-    // Client disconnect: remove only request-specific listeners,
-    // preserving safeEmitter()'s permanent error listener
+    // Client disconnect: remove request-specific listeners and release the
+    // CLI process so it doesn't stay "busy" with a response nobody consumes.
     res.on("close", () => {
       if (!isComplete) {
         emitter.removeListener("text_block_start", onTextBlockStart);
@@ -333,6 +333,13 @@ async function handlePooledStreaming(
         emitter.removeListener("assistant", onAssistant);
         emitter.removeListener("result", onResult);
         emitter.removeListener("error", onError);
+
+        // Tell the router to kill+respawn the process — it's mid-response
+        // with buffered output and no consumer.
+        const router = getPoolRouter();
+        if (router && sessionKey) {
+          router.cancelRequest(sessionKey);
+        }
       }
       resolve();
     });
