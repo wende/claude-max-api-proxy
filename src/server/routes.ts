@@ -51,6 +51,17 @@ export async function handleChatCompletions(
   const body = req.body as OpenAIChatRequest;
   const stream = body.stream === true;
   const startTime = Date.now();
+  const earlySessionKey = (req.headers["x-openclaw-session-key"] as string | undefined) || (body as any).sessionId;
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    event: "request_received",
+    requestId,
+    sessionKey: earlySessionKey || "(none)",
+    model: body.model || "(none)",
+    stream,
+    messageCount: body.messages?.length ?? 0,
+    contentLength: req.headers["content-length"] || "(none)",
+  }));
 
   try {
     // Validate request
@@ -84,6 +95,17 @@ export async function handleChatCompletions(
       if (result) {
         // Pooled route
         const { emitter, routeType, pid, queueDepth } = result;
+        console.log(JSON.stringify({
+          ts: new Date().toISOString(),
+          event: "request_routed",
+          requestId,
+          sessionKey,
+          model: cliInput.model,
+          routeType,
+          pid,
+          queueDepth,
+          elapsedMs: Date.now() - startTime,
+        }));
 
         if (stream) {
           await handlePooledStreaming(
