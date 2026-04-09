@@ -194,6 +194,18 @@ async function handlePooledStreaming(
     let isComplete = false;
     let hasEmittedText = false;
 
+    // Keep-alive: send SSE comments every 15s to prevent gateway SDK timeout.
+    // SSE lines starting with ":" are ignored by parsers but reset the
+    // connection idle timer. Stops once the first real content arrives.
+    const KEEP_ALIVE_INTERVAL_MS = 15_000;
+    const keepAliveTimer = setInterval(() => {
+      if (!hasEmittedText && !isComplete && !res.writableEnded) {
+        res.write(": keep-alive\n\n");
+      } else {
+        clearInterval(keepAliveTimer);
+      }
+    }, KEEP_ALIVE_INTERVAL_MS);
+
     const onTextBlockStart = () => {
       if (hasEmittedText && !res.writableEnded) {
         const sepChunk = {
@@ -241,6 +253,7 @@ async function handlePooledStreaming(
 
     const onResult = (result: ClaudeCliResult) => {
       isComplete = true;
+      clearInterval(keepAliveTimer);
       const latencyMs = Date.now() - startTime;
       console.log(
         JSON.stringify({
@@ -278,6 +291,7 @@ async function handlePooledStreaming(
 
     const onError = (error: Error) => {
       isComplete = true;
+      clearInterval(keepAliveTimer);
       const latencyMs = Date.now() - startTime;
       const errWithStatus = error as Error & {
         statusCode?: number;
@@ -327,6 +341,7 @@ async function handlePooledStreaming(
     // Client disconnect: remove request-specific listeners and release the
     // CLI process so it doesn't stay "busy" with a response nobody consumes.
     res.on("close", () => {
+      clearInterval(keepAliveTimer);
       if (!isComplete) {
         emitter.removeListener("text_block_start", onTextBlockStart);
         emitter.removeListener("content_delta", onContentDelta);
