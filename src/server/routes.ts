@@ -90,7 +90,8 @@ export async function handleChatCompletions(
         cliInput.prompt,
         cliInput.latestPrompt,
         cliInput.model,
-        sessionKey
+        sessionKey,
+        body.messages.length
       );
 
       if (result) {

@@ -104,6 +104,7 @@ export interface PooledProcess {
   lastRequestAt: number;
   spawnedAt: number;
   requestCount: number;
+  lastMessageCount: number;
   state: "idle" | "busy" | "recycling";
   requestQueue: PendingRequest[];
   buffer: string;
@@ -116,6 +117,7 @@ export interface PooledProcess {
 export interface PendingRequest {
   fullPrompt: string;
   latestPrompt: string;
+  messageCount: number;
   emitter: EventEmitter;
 }
 
@@ -225,7 +227,8 @@ export class SessionPoolRouter {
     prompt: string,
     latestPrompt: string,
     model: ClaudeModel,
-    sessionKey: string
+    sessionKey: string,
+    messageCount: number = 0
   ): ExecuteResult | null {
     if (this.shuttingDown) {
       const emitter = safeEmitter();
@@ -261,16 +264,42 @@ export class SessionPoolRouter {
 
     if (existing) {
       if (isPendingSentinel(existing)) {
-        return this.enqueueOnSentinel(existing, prompt, latestPrompt, sessionKey);
+        return this.enqueueOnSentinel(existing, prompt, latestPrompt, sessionKey, messageCount);
       }
 
       const proc = existing;
-      if (proc.state === "idle") {
+
+      // Detect gateway session reset: message count dropped below stored value.
+      // Normal flow is monotonically increasing; any drop means the gateway's
+      // context diverged (reset via /new, idle timeout, or compaction).
+      if (messageCount > 0 && proc.lastMessageCount > 0 && messageCount < proc.lastMessageCount) {
+        console.log(JSON.stringify({
+          ts: new Date().toISOString(),
+          event: "session_reset_detected",
+          sessionKey,
+          previousMessageCount: proc.lastMessageCount,
+          incomingMessageCount: messageCount,
+          processId: proc.id,
+          pid: proc.process.pid,
+          requestCount: proc.requestCount,
+        }));
+        if (proc.state === "busy") {
+          // Can't kill mid-request — remove lock now and let releaseProcess kill after.
+          this.lockedSessions.delete(sessionKey);
+          proc.lockedTo = null;
+          proc.orphaned = true;
+        } else {
+          this.clearSessionLock(sessionKey, proc);
+          this.killAndRespawn(proc);
+          this.processRecycles++;
+        }
+        // Fall through to warm/cold claim below
+      } else if (proc.state === "idle") {
         this.routeHits.locked++;
         this.totalRequests++;
-        return this.routeToProcess(proc, prompt, latestPrompt, "locked");
+        return this.routeToProcess(proc, prompt, latestPrompt, "locked", messageCount);
       } else {
-        return this.enqueueOnProcess(proc, prompt, latestPrompt, sessionKey);
+        return this.enqueueOnProcess(proc, prompt, latestPrompt, sessionKey, messageCount);
       }
     }
 
@@ -288,7 +317,7 @@ export class SessionPoolRouter {
       this.lockedSessions.set(sessionKey, proc);
       this.routeHits.warm++;
       this.totalRequests++;
-      return this.routeToProcess(proc, prompt, latestPrompt, "warm");
+      return this.routeToProcess(proc, prompt, latestPrompt, "warm", messageCount);
     }
 
     // Warm pool empty — need cold spawn
@@ -319,7 +348,7 @@ export class SessionPoolRouter {
         this.lockProcess(proc, sessionKey, agentChannel);
         this.transferSentinelQueue(sentinel, proc);
         this.lockedSessions.set(sessionKey, proc);
-        this.assignToProcess(proc, prompt, latestPrompt, emitter);
+        this.assignToProcess(proc, prompt, latestPrompt, emitter, messageCount);
       })
       .catch((err) => {
         console.log(
@@ -409,6 +438,7 @@ export class SessionPoolRouter {
       lastRequestAt: 0,
       spawnedAt: Date.now(),
       requestCount: 0,
+      lastMessageCount: 0,
       state: "idle",
       requestQueue: [],
       buffer: "",
@@ -536,10 +566,11 @@ export class SessionPoolRouter {
     proc: PooledProcess,
     prompt: string,
     latestPrompt: string,
-    routeType: "locked" | "warm" | "cold"
+    routeType: "locked" | "warm" | "cold",
+    messageCount: number = 0
   ): ExecuteResult {
     const emitter = safeEmitter();
-    this.assignToProcess(proc, prompt, latestPrompt, emitter);
+    this.assignToProcess(proc, prompt, latestPrompt, emitter, messageCount);
     return {
       emitter,
       routeType,
@@ -552,13 +583,15 @@ export class SessionPoolRouter {
     pooled: PooledProcess,
     fullPrompt: string,
     latestPrompt: string,
-    emitter: EventEmitter
+    emitter: EventEmitter,
+    messageCount: number = 0
   ): void {
     pooled.state = "busy";
     // Select prompt BEFORE incrementing requestCount.
     // Guard: if latestPrompt is empty (no user message in array), fall back to fullPrompt.
     const prompt = (pooled.requestCount === 0 || !latestPrompt) ? fullPrompt : latestPrompt;
     pooled.requestCount++;
+    pooled.lastMessageCount = messageCount;
     pooled.lastRequestAt = Date.now();
     pooled.currentEmitter = emitter;
 
@@ -664,7 +697,7 @@ export class SessionPoolRouter {
 
     const next = pooled.requestQueue.shift()!;
     this.totalRequests++;
-    this.assignToProcess(pooled, next.fullPrompt, next.latestPrompt, next.emitter);
+    this.assignToProcess(pooled, next.fullPrompt, next.latestPrompt, next.emitter, next.messageCount);
   }
 
   // -------------------------------------------------------------------------
@@ -721,7 +754,8 @@ export class SessionPoolRouter {
     proc: PooledProcess,
     fullPrompt: string,
     latestPrompt: string,
-    sessionKey: string
+    sessionKey: string,
+    messageCount: number = 0
   ): ExecuteResult | null {
     if (proc.state === "recycling") {
       this.routeHits.fallback++;
@@ -759,6 +793,7 @@ export class SessionPoolRouter {
     const pending: PendingRequest = {
       fullPrompt,
       latestPrompt,
+      messageCount,
       emitter,
     };
     proc.requestQueue.push(pending);
@@ -776,7 +811,8 @@ export class SessionPoolRouter {
     sentinel: PendingSentinel,
     fullPrompt: string,
     latestPrompt: string,
-    _sessionKey: string
+    _sessionKey: string,
+    messageCount: number = 0
   ): ExecuteResult | null {
     if (sentinel.requestQueue.length >= this.config.requestQueueDepth) {
       const emitter = safeEmitter();
@@ -798,7 +834,7 @@ export class SessionPoolRouter {
     }
 
     const emitter = safeEmitter();
-    sentinel.requestQueue.push({ fullPrompt, latestPrompt, emitter });
+    sentinel.requestQueue.push({ fullPrompt, latestPrompt, messageCount, emitter });
 
     return {
       emitter,
