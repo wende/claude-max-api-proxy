@@ -7,7 +7,8 @@ import type { OpenAIChatRequest, OpenAIContentBlock } from "../types/openai.js";
 export type ClaudeModel = "opus" | "sonnet" | "haiku";
 
 export interface CliInput {
-  prompt: string;
+  prompt: string;        // Full prompt (system + history + user) — for first turn
+  latestPrompt: string;  // Latest user message only — for subsequent turns
   model: ClaudeModel;
   sessionId?: string;
 }
@@ -61,7 +62,11 @@ function extractText(content: string | OpenAIContentBlock[]): string {
   }
   if (Array.isArray(content)) {
     return content
-      .filter((block) => block.type === "text" || block.type === "input_text")
+      .filter(
+        (block) =>
+          (block.type === "text" || block.type === "input_text") &&
+          block.text != null
+      )
       .map((block) => block.text)
       .join("\n");
   }
@@ -133,11 +138,28 @@ export function messagesToPrompt(
 }
 
 /**
+ * Extract only the latest user message from the messages array.
+ * Used by pooled processes on subsequent turns (requestCount > 0)
+ * where the CLI already has system context and prior turns in memory.
+ */
+export function latestUserMessage(
+  messages: OpenAIChatRequest["messages"]
+): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      return extractText(messages[i].content);
+    }
+  }
+  return "";
+}
+
+/**
  * Convert OpenAI chat request to CLI input format
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
   return {
     prompt: messagesToPrompt(request.messages),
+    latestPrompt: latestUserMessage(request.messages),
     model: extractModel(request.model),
     sessionId: request.user, // Use OpenAI's user field for session mapping
   };
