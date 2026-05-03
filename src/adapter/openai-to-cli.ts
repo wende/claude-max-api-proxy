@@ -15,11 +15,12 @@ export interface CliInput {
 const MODEL_MAP: Record<string, ClaudeModel> = {
   // Direct model names (provider prefixes like `claude-code-cli/` and `claude-max/`
   // are stripped by extractModel before consulting this map)
-  "claude-opus-4": "opus",
   "claude-opus-4-6": "opus",
+  "claude-opus-4": "opus",
+  "claude-sonnet-4-6": "sonnet",
   "claude-sonnet-4": "sonnet",
   "claude-sonnet-4-5": "sonnet",
-  "claude-sonnet-4-6": "sonnet",
+  "claude-haiku-4-6": "haiku",
   "claude-haiku-4": "haiku",
   "claude-haiku-4-5": "haiku",
   // Bare aliases

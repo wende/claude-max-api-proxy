@@ -49,7 +49,7 @@ async function main(): Promise<void> {
     console.log("\nServer ready. Test with:");
     console.log(`  curl -X POST http://localhost:${port}/v1/chat/completions \\`);
     console.log(`    -H "Content-Type: application/json" \\`);
-    console.log(`    -d '{"model": "claude-sonnet-4", "messages": [{"role": "user", "content": "Hello!"}]}'`);
+    console.log(`    -d '{"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "Hello!"}]}'`);
     console.log("\nPress Ctrl+C to stop.\n");
   } catch (err) {
     console.error("Failed to start server:", err);

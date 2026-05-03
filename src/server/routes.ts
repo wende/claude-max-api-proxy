@@ -103,7 +103,7 @@ async function handleStreamingResponse(
 
   return new Promise<void>((resolve, reject) => {
     let isFirst = true;
-    let lastModel = "claude-sonnet-4";
+    let lastModel = "claude-sonnet-4-6";
     let isComplete = false;
     let hasEmittedText = false;
     let toolCallIndex = 0;
@@ -386,11 +386,12 @@ async function handleNonStreamingResponse(
 export function handleModels(_req: Request, res: Response): void {
   const now = Math.floor(Date.now() / 1000);
   const modelIds = [
-    "claude-opus-4",
     "claude-opus-4-6",
+    "claude-opus-4",
+    "claude-sonnet-4-6",
     "claude-sonnet-4",
     "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
+    "claude-haiku-4-6",
     "claude-haiku-4",
     "claude-haiku-4-5",
   ];
