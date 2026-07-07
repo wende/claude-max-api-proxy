@@ -8,6 +8,7 @@
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import fs from "fs/promises";
+import { existsSync } from "fs";
 import path from "path";
 import type {
   ClaudeCliMessage,
@@ -43,6 +44,38 @@ export interface SubprocessEvents {
 }
 
 const DEFAULT_TIMEOUT = 900000; // 15 minutes
+
+/**
+ * Resolve the Claude CLI binary. On Windows, `claude` on PATH is an npm .cmd
+ * shim, which spawn() cannot execute without a shell (rejected since the
+ * Node 18 CVE-2024-27980 fix). The shim only forwards to a native claude.exe,
+ * so locate and use that exe directly instead.
+ */
+function resolveClaudeBin(): string {
+  if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
+  if (process.platform === "win32") {
+    const candidates = [
+      process.env.APPDATA &&
+        path.join(
+          process.env.APPDATA,
+          "npm",
+          "node_modules",
+          "@anthropic-ai",
+          "claude-code",
+          "bin",
+          "claude.exe"
+        ),
+      process.env.USERPROFILE &&
+        path.join(process.env.USERPROFILE, ".local", "bin", "claude.exe"),
+    ];
+    for (const candidate of candidates) {
+      if (candidate && existsSync(candidate)) return candidate;
+    }
+  }
+  return "claude";
+}
+
+const CLAUDE_BIN = resolveClaudeBin();
 
 /**
  * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
@@ -104,7 +137,7 @@ export class ClaudeSubprocess extends EventEmitter {
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
-        this.process = spawn(process.env.CLAUDE_BIN || "claude", args, {
+        this.process = spawn(CLAUDE_BIN, args, {
           cwd: options.cwd || process.cwd(),
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
@@ -294,7 +327,7 @@ export class ClaudeSubprocess extends EventEmitter {
  */
 export async function verifyClaude(): Promise<{ ok: boolean; error?: string; version?: string }> {
   return new Promise((resolve) => {
-    const proc = spawn(process.env.CLAUDE_BIN || "claude", ["--version"], { stdio: "pipe" });
+    const proc = spawn(CLAUDE_BIN, ["--version"], { stdio: "pipe" });
     let output = "";
 
     proc.stdout?.on("data", (chunk: Buffer) => {
