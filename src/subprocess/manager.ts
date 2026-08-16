@@ -107,11 +107,25 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
         const res = await fetch(img.sourceUrl, {
           signal: AbortSignal.timeout(5000),
         });
-        if (!res.ok) continue;
+        if (!res.ok || !res.body) continue;
         const contentLength = Number(res.headers.get("content-length") || 0);
         if (contentLength > MAX_IMAGE_BYTES) continue;
         mime = mime || res.headers.get("content-type") || "";
-        buffer = Buffer.from(await res.arrayBuffer());
+        // Enforce the size limit while streaming: abort as soon as the body
+        // exceeds MAX_IMAGE_BYTES instead of buffering unbounded data first
+        const chunks: Buffer[] = [];
+        let received = 0;
+        let tooLarge = false;
+        for await (const chunk of res.body) {
+          received += (chunk as Buffer).length;
+          if (received > MAX_IMAGE_BYTES) {
+            tooLarge = true;
+            break;
+          }
+          chunks.push(Buffer.from(chunk));
+        }
+        if (tooLarge) continue;
+        buffer = Buffer.concat(chunks);
       } else {
         buffer = Buffer.from(img.data, "base64");
       }

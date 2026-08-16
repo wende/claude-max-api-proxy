@@ -346,10 +346,10 @@ async function handleStreamingResponse(
         return;
       }
       // CLI surfaces auth failures as plain text on stdout in some failure
-      // modes - replace with actionable guidance
+      // modes - swallow them here; the error/close handlers emit the guidance
+      // message exactly once.
       if (text && subprocess.hasAuthError()) {
-        text = AUTH_EXPIRED_MESSAGE;
-        isComplete = true;
+        return;
       }
       if (text && !res.writableEnded) {
         const chunk = {
@@ -499,6 +499,8 @@ async function handleStreamingResponse(
           }],
         };
         res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
+        hasEmittedText = true;
+        isFirst = false;
       }
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
