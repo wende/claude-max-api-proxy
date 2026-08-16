@@ -110,6 +110,9 @@ export interface ClaudeCliStreamEvent {
     } | {
       type: "input_json_delta";
       partial_json: string;
+    } | {
+      type: "thinking_delta";
+      thinking: string;
     };
     content_block?: {
       type: "text";
@@ -118,6 +121,9 @@ export interface ClaudeCliStreamEvent {
       type: "tool_use";
       id: string;
       name: string;
+    } | {
+      type: "thinking";
+      thinking: string;
     };
     message?: {
       model: string;
@@ -177,6 +183,14 @@ export function isInputJsonDelta(msg: ClaudeCliMessage): msg is ClaudeCliStreamE
     isStreamEvent(msg) &&
     msg.event.type === "content_block_delta" &&
     msg.event.delta?.type === "input_json_delta"
+  );
+}
+
+export function isThinkingDelta(msg: ClaudeCliMessage): msg is ClaudeCliStreamEvent {
+  return (
+    isStreamEvent(msg) &&
+    msg.event.type === "content_block_delta" &&
+    (msg.event.delta as { type?: string } | undefined)?.type === "thinking_delta"
   );
 }
 

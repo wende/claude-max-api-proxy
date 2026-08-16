@@ -101,6 +101,13 @@ export function cliResultToOpenai(
       completion_tokens: result.usage?.output_tokens || 0,
       total_tokens:
         (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
+      // Prompt caching is automatic in Claude Code - surface the metrics
+      ...(result.usage?.cache_read_input_tokens
+        ? { cache_read_input_tokens: result.usage.cache_read_input_tokens }
+        : {}),
+      ...(result.usage?.cache_creation_input_tokens
+        ? { cache_creation_input_tokens: result.usage.cache_creation_input_tokens }
+        : {}),
     },
   };
 }
@@ -111,6 +118,9 @@ export function cliResultToOpenai(
  */
 function normalizeModelName(model: string | undefined): string {
   if (!model) return "claude-sonnet-4";
+  // Keep the major version visible: "claude-opus-5-..." -> "claude-opus-5"
+  const m = model.match(/claude-(opus|sonnet|haiku)-(\d+)/);
+  if (m) return `claude-${m[1]}-${m[2]}`;
   if (model.includes("opus")) return "claude-opus-4";
   if (model.includes("sonnet")) return "claude-sonnet-4";
   if (model.includes("haiku")) return "claude-haiku-4";
