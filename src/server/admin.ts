@@ -259,7 +259,9 @@ export function createAdminRouter(): Router {
           });
           return;
         }
-        res.json({ ...parseUsage(stdout.toString()), cached: false });
+        const data = parseUsage(stdout.toString());
+        usageCache = { at: Date.now(), data };
+        res.json({ ...data, cached: false });
       }
     );
   });

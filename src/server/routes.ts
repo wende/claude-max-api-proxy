@@ -220,8 +220,8 @@ async function handleStreamingResponse(
       // CLI surfaces auth failures as plain text on stdout in some failure
       // modes - replace with actionable guidance
       if (text && subprocess.hasAuthError()) {
-        text = AUTH_EXPIRED_MESSAGE;
-        isComplete = true;
+        // error/close handlers emit the guidance exactly once
+        return;
       }
       if (text && !res.writableEnded) {
         const chunk = {
