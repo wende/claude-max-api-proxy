@@ -7,6 +7,8 @@
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
 import { handleChatCompletions, handleModels, handleHealth } from "./routes.js";
+import { apiKeyAuth, adminAuth } from "./auth.js";
+import { createAdminRouter } from "./admin.js";
 
 export interface ServerConfig {
   port: number;
@@ -69,6 +71,12 @@ function createApp(): Express {
   app.options("*", (_req: Request, res: Response) => {
     res.sendStatus(200);
   });
+
+  // API key authentication (protects all routes except /health, see auth.ts)
+  app.use(apiKeyAuth);
+
+  // Admin routes (relogin flow) - separate key requirement
+  app.use("/admin", adminAuth, createAdminRouter());
 
   // Routes
   app.get("/health", handleHealth);
