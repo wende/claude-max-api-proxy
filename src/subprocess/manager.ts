@@ -24,8 +24,10 @@ import {
   isToolUseBlockStart,
   isInputJsonDelta,
   isContentBlockStop,
+  isThinkingDelta,
 } from "../types/claude-cli.js";
-import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+import type { ClaudeModel, CliImage, ClaudeEffort } from "../adapter/openai-to-cli.js";
+import os from "os";
 
 export interface SubprocessOptions {
   model: ClaudeModel;
@@ -34,7 +36,24 @@ export interface SubprocessOptions {
   resume?: boolean;
   cwd?: string;
   timeout?: number;
+  /** Reasoning effort passed through to the CLI via --effort */
+  effort?: ClaudeEffort;
+  /** Disable all built-in CLI tools (when the client provides its own tool list) */
+  disableBuiltinTools?: boolean;
+  /** Images to stage as temp files so Claude can Read them */
+  images?: CliImage[];
 }
+
+/** Max size per image (decoded), 20 MB - generous but bounded */
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+const MIME_TO_EXT: Record<string, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+};
 
 export interface SubprocessEvents {
   message: (msg: ClaudeCliMessage) => void;
@@ -46,6 +65,93 @@ export interface SubprocessEvents {
 }
 
 const DEFAULT_TIMEOUT = 900000; // 15 minutes
+
+/**
+ * Detect authentication/authorization failures from CLI stderr or exit codes.
+ * The CLI surfaces expired OAuth tokens as 401/authentication_error text on
+ * stderr (there is no structured error type in stream-json), so we match the
+ * known signatures.
+ */
+export function isAuthError(stderr: string, exitCode: number | null): boolean {
+  if (exitCode === 401) return true;
+  const text = stderr.toLowerCase();
+  return (
+    text.includes("authentication_error") ||
+    text.includes("authentication failed") ||
+    (text.includes("401") && text.includes("unauthorized")) ||
+    text.includes("oauth token has expired") ||
+    text.includes("token expired") ||
+    text.includes("invalid oauth token") ||
+    (text.includes("not logged in") && text.includes("claude")) ||
+    text.includes("please run /login") ||
+    text.includes("please run claude auth login")
+  );
+}
+
+/**
+ * Stage request images as temp files so the CLI can read them via the Read tool.
+ * Returns absolute file paths. Caller is responsible for cleanup.
+ * Remote URLs are downloaded (5s timeout, bounded size).
+ */
+export async function stageImages(images: CliImage[]): Promise<string[]> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "cmap-img-"));
+  const paths: string[] = [];
+
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    try {
+      let buffer: Buffer;
+      let mime = img.mimeType;
+
+      if (img.sourceUrl) {
+        const res = await fetch(img.sourceUrl, {
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!res.ok || !res.body) continue;
+        const contentLength = Number(res.headers.get("content-length") || 0);
+        if (contentLength > MAX_IMAGE_BYTES) continue;
+        mime = mime || res.headers.get("content-type") || "";
+        // Enforce the size limit while streaming: abort as soon as the body
+        // exceeds MAX_IMAGE_BYTES instead of buffering unbounded data first
+        const chunks: Buffer[] = [];
+        let received = 0;
+        let tooLarge = false;
+        for await (const chunk of res.body) {
+          received += (chunk as Buffer).length;
+          if (received > MAX_IMAGE_BYTES) {
+            tooLarge = true;
+            break;
+          }
+          chunks.push(Buffer.from(chunk));
+        }
+        if (tooLarge) continue;
+        buffer = Buffer.concat(chunks);
+      } else {
+        buffer = Buffer.from(img.data, "base64");
+      }
+
+      if (buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) continue;
+      const ext = MIME_TO_EXT[mime] || ".png";
+      const file = path.join(dir, `image-${i + 1}${ext}`);
+      await fs.writeFile(file, buffer);
+      paths.push(file);
+    } catch {
+      // Skip broken images silently - prompt text still goes through
+    }
+  }
+
+  return paths;
+}
+
+/** Best-effort cleanup of staged image files (whole temp dir) */
+export async function cleanupImages(paths: string[]): Promise<void> {
+  const dirs = new Set(paths.map((p) => path.dirname(p)));
+  for (const dir of dirs) {
+    if (dir.includes("cmap-img-")) {
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
 
 /**
  * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
@@ -194,6 +300,8 @@ function killProcessTree(
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
+  private stderrBuffer: string = "";
+  private exitCode: number | null = null;
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
 
@@ -255,10 +363,12 @@ export class ClaudeSubprocess extends EventEmitter {
           this.processBuffer();
         });
 
-        // Capture stderr for debugging
+        // Capture stderr for debugging and auth-error detection
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
+            // Keep a bounded tail (4 KB) - enough for error signatures
+            this.stderrBuffer = (this.stderrBuffer + errorText + "\n").slice(-4096);
             // Don't emit as error unless it's actually an error
             // Claude CLI may write debug info to stderr
             if (process.env.DEBUG_SUBPROCESS) {
@@ -269,6 +379,7 @@ export class ClaudeSubprocess extends EventEmitter {
 
         // Handle process close
         this.process.on("close", (code) => {
+          this.exitCode = code;
           if (process.env.DEBUG_SUBPROCESS) {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
@@ -306,6 +417,16 @@ export class ClaudeSubprocess extends EventEmitter {
       OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
+
+    if (options.effort) {
+      args.push("--effort", options.effort);
+    }
+
+    // Client-provided tools (OpenAI function calling): the CLI must NOT execute
+    // anything itself - no Bash, no Read, nothing. Execution happens client-side.
+    if (options.disableBuiltinTools) {
+      args.push("--tools", "");
+    }
 
     if (options.sessionId && options.resume) {
       // Continue a previously persisted session — avoids replaying full history
@@ -358,6 +479,9 @@ export class ClaudeSubprocess extends EventEmitter {
         if (isContentDelta(message)) {
           // Emit content delta for streaming (text_delta only)
           this.emit("content_delta", message as ClaudeCliStreamEvent);
+        } else if (isThinkingDelta(message)) {
+          // Extended thinking stream (visible when effort > default)
+          this.emit("thinking_delta", message as unknown as ClaudeCliStreamEvent);
         } else if (isAssistantMessage(message)) {
           this.emit("assistant", message);
         } else if (isResultMessage(message)) {
@@ -388,6 +512,14 @@ export class ClaudeSubprocess extends EventEmitter {
       this.clearTimeout();
       this.isKilled = killProcessTree(this.process, signal);
     }
+  }
+
+  /**
+   * True if the subprocess failed due to an authentication problem
+   * (expired OAuth token, logged out). Check after "close"/"error".
+   */
+  hasAuthError(): boolean {
+    return isAuthError(this.stderrBuffer, this.exitCode);
   }
 
   /**

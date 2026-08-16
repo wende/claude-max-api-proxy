@@ -6,7 +6,8 @@
 
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { ClaudeSubprocess } from "../subprocess/manager.js";
+import { existsSync, readdirSync } from "fs";
+import { ClaudeSubprocess, stageImages, cleanupImages } from "../subprocess/manager.js";
 import { openaiToCli, openaiToCliDelta } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
@@ -15,6 +16,84 @@ import {
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
 import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+
+/**
+ * Check whether Claude CLI credentials exist at all. On a fresh container
+ * with an empty /data volume, every request would otherwise run into the
+ * CLI's onboarding/login failure - we can answer that upfront instead.
+ */
+function hasClaudeCredentials(): boolean {
+  const dir = process.env.CLAUDE_CONFIG_DIR || `${process.env.HOME}/.claude`;
+  try {
+    if (!existsSync(dir)) return false;
+    return readdirSync(dir).some((f) => f.endsWith(".json"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * User-facing guidance when the Claude CLI's OAuth session has expired.
+ * Returned as a normal assistant message instead of a raw 500 so the user
+ * sees actionable steps directly in their chat client.
+ */
+const AUTH_EXPIRED_MESSAGE = [
+  "Die Claude-Anmeldung auf dem Server ist abgelaufen – Anfragen sind derzeit nicht moeglich.",
+  "",
+  "Neuanmeldung direkt ueber die Admin-API (kein Server-Zugriff noetig):",
+  "1. `POST /admin/relogin/start` (mit Admin-Key) – die Antwort enthaelt eine Login-URL.",
+  "2. URL im Browser oeffnen und die Anmeldung bestaetigen.",
+  "3. Den angezeigten Code per `POST /admin/relogin/complete` zurueckschicken.",
+  "4. Danach funktioniert dieser Chat sofort wieder – die neuen Tokens liegen persistent im Volume.",
+  "",
+  "Details: siehe DOCKER.md, Abschnitt 'Re-Login ohne Container-Zugriff'.",
+].join("\n");
+
+/**
+ * Parse a <tool_call>{...}</tool_call> envelope from Claude's text output.
+ * Claude Code has no client-executed tool protocol in --print mode, so tool
+ * requests arrive as text; we convert them into OpenAI tool_calls.
+ */
+function parseToolCall(text: string): { name: string; arguments: string } | null {
+  const m = text.match(/<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/);
+  if (!m) return null;
+  try {
+    const parsed = JSON.parse(m[1]);
+    if (typeof parsed.name !== "string") return null;
+    return {
+      name: parsed.name,
+      arguments:
+        typeof parsed.arguments === "string"
+          ? parsed.arguments
+          : JSON.stringify(parsed.arguments ?? {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+let toolCallSeq = 0;
+function nextToolCallId(): string {
+  return `call_${Date.now().toString(36)}${(toolCallSeq++).toString(36)}`;
+}
+
+/** Build an OpenAI-style assistant message body (non-streaming) */
+function authExpiredResponse(requestId: string, model: string) {
+  return {
+    id: `chatcmpl-${requestId}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: AUTH_EXPIRED_MESSAGE },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+}
 
 interface SessionContext {
   sessionKey: string | undefined;
@@ -42,6 +121,8 @@ function resolveCliInput(body: OpenAIChatRequest): {
   if (existing) {
     const cliInput = openaiToCliDelta(body, existing.messageCount);
     cliInput.sessionId = existing.claudeSessionId;
+    // Effort is per-request, not per-session: honor it on resumed turns too
+    cliInput.effort = openaiToCli(body).effort;
     return { cliInput, sessionKey, resume: true };
   }
 
@@ -78,15 +159,64 @@ export async function handleChatCompletions(
       return;
     }
 
+    // Fresh container without any login: answer upfront instead of
+    // letting the request run into the CLI's onboarding failure
+    if (!hasClaudeCredentials()) {
+      console.error("[Auth] No Claude credentials found - prompting admin to run the relogin flow");
+      const guidance = authExpiredResponse(requestId, "claude-sonnet-4");
+      if (stream) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.flushHeaders();
+        const chunk = {
+          id: guidance.id,
+          object: "chat.completion.chunk",
+          created: guidance.created,
+          model: guidance.model,
+          choices: [
+            { index: 0, delta: { role: "assistant", content: guidance.choices[0].message.content }, finish_reason: null },
+            { index: 0, delta: {}, finish_reason: "stop" },
+          ],
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } else {
+        res.json(guidance);
+      }
+      return;
+    }
+
     // Convert to CLI input format, resuming a persisted session when we have one
     const { cliInput, sessionKey, resume } = resolveCliInput(body);
     const subprocess = new ClaudeSubprocess();
     const sessionCtx: SessionContext = { sessionKey, resume, messageCount: body.messages.length };
 
-    if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId, sessionCtx);
-    } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx);
+    // Stage attached images (OpenAI image_url blocks) as temp files and point
+    // the prompt at them - Claude Code reads them via its Read tool
+    let stagedImages: string[] = [];
+    if (cliInput.images && cliInput.images.length > 0) {
+      stagedImages = await stageImages(cliInput.images);
+      delete cliInput.images; // don't hold base64 in memory longer than needed
+      if (stagedImages.length > 0) {
+        const listing = stagedImages.map((p, i) => `${i + 1}. ${p}`).join("\n");
+        cliInput.prompt =
+          `[Attached images - use your Read tool on each file to view them]\n${listing}\n\n` +
+          cliInput.prompt;
+      }
+    }
+
+    try {
+      if (stream) {
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId, sessionCtx);
+      } else {
+        await handleNonStreamingResponse(res, subprocess, cliInput, requestId, sessionCtx);
+      }
+    } finally {
+      if (stagedImages.length > 0) {
+        await cleanupImages(stagedImages);
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -147,6 +277,10 @@ async function handleStreamingResponse(
     let hasEmittedText = false;
     let toolCallIndex = 0;
     let inToolBlock = false;
+    let accumulatedText = "";
+    // When the client provides tools, Claude asks for them via a <tool_call>
+    // text envelope - buffer text so we can convert it into real tool_calls
+    const expectsClientTools = !!cliInput.hasClientTools;
 
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
@@ -178,10 +312,45 @@ async function handleStreamingResponse(
       }
     });
 
+    // Extended thinking: forward as OpenAI-style reasoning chunks
+    // (OpenWebUI renders delta.reasoning as a collapsible "thinking" section).
+    // Note: subscription-billed thinking is often redacted/encrypted server-side
+    // (empty deltas with only estimated_tokens) - those are skipped here.
+    subprocess.on("thinking_delta", (event: ClaudeCliStreamEvent) => {
+      const delta = event.event.delta;
+      const text = (delta?.type === "thinking_delta" && delta.thinking) || "";
+      if (text && !res.writableEnded) {
+        const chunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{
+            index: 0,
+            delta: { reasoning: text },
+            finish_reason: null,
+          }],
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+    });
+
     // Handle streaming content deltas
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const delta = event.event.delta;
-      const text = (delta?.type === "text_delta" && delta.text) || "";
+      let text = (delta?.type === "text_delta" && delta.text) || "";
+      if (expectsClientTools) {
+        // Buffer instead of streaming: the text may be a <tool_call> envelope
+        // that must be converted into tool_calls, never shown to the user
+        accumulatedText += text;
+        return;
+      }
+      // CLI surfaces auth failures as plain text on stdout in some failure
+      // modes - swallow them here; the error/close handlers emit the guidance
+      // message exactly once.
+      if (text && subprocess.hasAuthError()) {
+        return;
+      }
       if (text && !res.writableEnded) {
         const chunk = {
           id: `chatcmpl-${requestId}`,
@@ -284,6 +453,55 @@ async function handleStreamingResponse(
       if (sessionCtx.sessionKey && cliInput.sessionId) {
         setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
       }
+      // Client-tool request? The streamed text is a <tool_call> envelope -
+      // replace it with proper OpenAI tool_calls chunks
+      if (expectsClientTools) {
+        const tc = parseToolCall(accumulatedText || result.result || "");
+        if (tc && !res.writableEnded) {
+          const callId = nextToolCallId();
+          const chunk = {
+            id: `chatcmpl-${requestId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: lastModel,
+            choices: [{
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: [{
+                  index: 0,
+                  id: callId,
+                  type: "function",
+                  function: { name: tc.name, arguments: tc.arguments },
+                }],
+              },
+              finish_reason: "tool_calls",
+            }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+          resolve();
+          return;
+        }
+      }
+      // No tool call detected - flush the buffered text as regular content
+      if (expectsClientTools && accumulatedText && !res.writableEnded) {
+        const textChunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{
+            index: 0,
+            delta: { role: "assistant", content: accumulatedText },
+            finish_reason: null,
+          }],
+        };
+        res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
+        hasEmittedText = true;
+        isFirst = false;
+      }
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
@@ -293,6 +511,13 @@ async function handleStreamingResponse(
             completion_tokens: result.usage.output_tokens || 0,
             total_tokens:
               (result.usage.input_tokens || 0) + (result.usage.output_tokens || 0),
+            // Prompt caching is automatic in Claude Code - surface the metrics
+            ...(result.usage.cache_read_input_tokens
+              ? { cache_read_input_tokens: result.usage.cache_read_input_tokens }
+              : {}),
+            ...(result.usage.cache_creation_input_tokens
+              ? { cache_creation_input_tokens: result.usage.cache_creation_input_tokens }
+              : {}),
           };
         }
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
@@ -308,6 +533,23 @@ async function handleStreamingResponse(
       // next turn self-heals with a fresh full-history session
       if (sessionCtx.resume && sessionCtx.sessionKey) {
         clearSession(sessionCtx.sessionKey);
+      }
+      if (subprocess.hasAuthError()) {
+        console.error("[Auth] Claude CLI authentication expired - user notified in chat");
+        if (!res.writableEnded) {
+          const chunk = {
+            id: `chatcmpl-${requestId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: lastModel,
+            choices: [{ index: 0, delta: { role: "assistant", content: AUTH_EXPIRED_MESSAGE }, finish_reason: null }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+        resolve();
+        return;
       }
       if (!res.writableEnded) {
         res.write(
@@ -345,6 +587,8 @@ async function handleStreamingResponse(
       model: cliInput.model,
       sessionId: cliInput.sessionId,
       resume: sessionCtx.resume,
+      effort: cliInput.effort,
+      disableBuiltinTools: cliInput.hasClientTools,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
       reject(err);
@@ -391,6 +635,12 @@ async function handleNonStreamingResponse(
       if (sessionCtx.resume && sessionCtx.sessionKey) {
         clearSession(sessionCtx.sessionKey);
       }
+      if (subprocess.hasAuthError()) {
+        console.error("[Auth] Claude CLI authentication expired - user notified in chat");
+        res.json(authExpiredResponse(requestId, "claude-sonnet-4"));
+        resolve();
+        return;
+      }
       res.status(500).json({
         error: {
           message: error.message,
@@ -406,19 +656,58 @@ async function handleNonStreamingResponse(
         if (sessionCtx.sessionKey && cliInput.sessionId) {
           setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
         }
+        // Client-tool request? Convert <tool_call> text into OpenAI tool_calls
+        if (cliInput.hasClientTools) {
+          const tc = parseToolCall(finalResult.result || "");
+          if (tc) {
+            res.json({
+              id: `chatcmpl-${requestId}`,
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: "claude-sonnet-4",
+              choices: [{
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [{
+                    id: nextToolCallId(),
+                    type: "function",
+                    function: { name: tc.name, arguments: tc.arguments },
+                  }],
+                },
+                finish_reason: "tool_calls",
+              }],
+              usage: {
+                prompt_tokens: finalResult.usage?.input_tokens || 0,
+                completion_tokens: finalResult.usage?.output_tokens || 0,
+                total_tokens:
+                  (finalResult.usage?.input_tokens || 0) +
+                  (finalResult.usage?.output_tokens || 0),
+              },
+            });
+            resolve();
+            return;
+          }
+        }
         res.json(cliResultToOpenai(finalResult, requestId));
       } else {
         if (sessionCtx.resume && sessionCtx.sessionKey) {
           clearSession(sessionCtx.sessionKey);
         }
         if (!res.headersSent) {
-          res.status(500).json({
-            error: {
-              message: `Claude CLI exited with code ${code} without response`,
-              type: "server_error",
-              code: null,
-            },
-          });
+          if (subprocess.hasAuthError()) {
+            console.error("[Auth] Claude CLI authentication expired - user notified in chat");
+            res.json(authExpiredResponse(requestId, "claude-sonnet-4"));
+          } else {
+            res.status(500).json({
+              error: {
+                message: `Claude CLI exited with code ${code} without response`,
+                type: "server_error",
+                code: null,
+              },
+            });
+          }
         }
       }
       resolve();
@@ -430,6 +719,8 @@ async function handleNonStreamingResponse(
         model: cliInput.model,
         sessionId: cliInput.sessionId,
         resume: sessionCtx.resume,
+        effort: cliInput.effort,
+        disableBuiltinTools: cliInput.hasClientTools,
       })
       .catch((error) => {
         res.status(500).json({
