@@ -3,10 +3,13 @@
  * Used for Clawdbot integration
  */
 
-export interface OpenAIContentBlock {
-  type: "text" | "input_text";
-  text: string;
+export interface OpenAIImageUrl {
+  url: string; // http(s) URL or data:<mime>;base64,<data>
 }
+
+export type OpenAIContentBlock =
+  | { type: "text" | "input_text"; text: string }
+  | { type: "image_url"; image_url: OpenAIImageUrl };
 
 export interface OpenAIChatMessage {
   role: "system" | "user" | "assistant";
@@ -23,6 +26,8 @@ export interface OpenAIChatRequest {
   frequency_penalty?: number;
   presence_penalty?: number;
   user?: string; // Used for session mapping
+  reasoning_effort?: string; // OpenAI style: low/medium/high (also: xhigh/max)
+  effort?: string; // Anthropic style alias
 }
 
 export interface OpenAIToolCall {
@@ -64,6 +69,8 @@ export interface OpenAIChatResponse {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
 }
 
@@ -89,6 +96,8 @@ export interface OpenAIChatChunk {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
 }
 

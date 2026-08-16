@@ -4,12 +4,37 @@
 
 import type { OpenAIChatRequest, OpenAIContentBlock } from "../types/openai.js";
 
+export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
 export type ClaudeModel = "opus" | "sonnet" | "haiku";
+
+export interface CliImage {
+  /** MIME type, e.g. image/png */
+  mimeType: string;
+  /** Raw base64 payload (without data URL prefix) */
+  data: string;
+  /** Original remote URL if the client sent one (no base64 copy kept) */
+  sourceUrl?: string;
+}
 
 export interface CliInput {
   prompt: string;
   model: ClaudeModel;
   sessionId?: string;
+  effort?: ClaudeEffort;
+  /** Images extracted from image_url content blocks, to be materialized as temp files */
+  images?: CliImage[];
+}
+
+const EFFORT_LEVELS: ClaudeEffort[] = ["low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Normalize effort from an OpenAI-compatible request (reasoning_effort or effort).
+ * Unknown values are ignored so the CLI default applies.
+ */
+export function extractEffort(request: OpenAIChatRequest): ClaudeEffort | undefined {
+  const raw = (request.reasoning_effort || request.effort || "").toLowerCase().trim();
+  return (EFFORT_LEVELS as string[]).includes(raw) ? (raw as ClaudeEffort) : undefined;
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
@@ -64,10 +89,33 @@ function extractText(content: string | OpenAIContentBlock[]): string {
   if (Array.isArray(content)) {
     return content
       .filter((block) => block.type === "text" || block.type === "input_text")
-      .map((block) => block.text)
+      .map((block) => (block as { text: string }).text)
       .join("\n");
   }
   return String(content || "");
+}
+
+/**
+ * Extract images from OpenAI image_url content blocks.
+ * Data URLs (what OpenWebUI sends for uploads) are decoded to base64 payloads;
+ * remote http(s) URLs are passed through as sourceUrl for later download.
+ */
+export function extractImages(messages: OpenAIChatRequest["messages"]): CliImage[] {
+  const images: CliImage[] = [];
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block.type !== "image_url" || !block.image_url?.url) continue;
+      const url = block.image_url.url;
+      const dataUrl = url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+      if (dataUrl) {
+        images.push({ mimeType: dataUrl[1], data: dataUrl[2] });
+      } else if (/^https?:\/\//.test(url)) {
+        images.push({ mimeType: "", data: "", sourceUrl: url });
+      }
+    }
+  }
+  return images;
 }
 
 /**
@@ -138,10 +186,13 @@ export function messagesToPrompt(
  * Convert OpenAI chat request to CLI input format
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
+  const images = extractImages(request.messages);
   return {
     prompt: messagesToPrompt(request.messages),
     model: extractModel(request.model),
     sessionId: request.user, // Use OpenAI's user field for session mapping
+    effort: extractEffort(request),
+    ...(images.length > 0 ? { images } : {}),
   };
 }
 
@@ -159,11 +210,15 @@ export function openaiToCliDelta(
     .slice(sinceIndex)
     .filter((m) => m.role !== "assistant");
 
+  const source = newMessages.length ? newMessages : request.messages;
+  const images = extractImages(source);
   return {
     // Fallback to full history if nothing new was found (shouldn't happen,
     // but never send an empty prompt to the CLI)
-    prompt: messagesToPrompt(newMessages.length ? newMessages : request.messages),
+    prompt: messagesToPrompt(source),
     model: extractModel(request.model),
     sessionId: request.user,
+    effort: extractEffort(request),
+    ...(images.length > 0 ? { images } : {}),
   };
 }
