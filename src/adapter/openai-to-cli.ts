@@ -2,7 +2,7 @@
  * Converts OpenAI chat request format to Claude CLI input
  */
 
-import type { OpenAIChatRequest, OpenAIContentBlock } from "../types/openai.js";
+import type { OpenAIChatRequest, OpenAIContentBlock, OpenAIToolDefinition } from "../types/openai.js";
 
 export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -24,6 +24,10 @@ export interface CliInput {
   effort?: ClaudeEffort;
   /** Images extracted from image_url content blocks, to be materialized as temp files */
   images?: CliImage[];
+  /** Client-side tool definitions from the OpenAI request */
+  tools?: OpenAIToolDefinition[];
+  /** True when the client sent tools - the CLI's built-in tools must be disabled then */
+  hasClientTools?: boolean;
 }
 
 const EFFORT_LEVELS: ClaudeEffort[] = ["low", "medium", "high", "xhigh", "max"];
@@ -82,7 +86,10 @@ export function extractModel(model: string): ClaudeModel {
  *   - A plain string: "Hello"
  *   - An array of content blocks: [{"type": "text", "text": "Hello"}]
  */
-function extractText(content: string | OpenAIContentBlock[]): string {
+function extractText(content: string | OpenAIContentBlock[] | null): string {
+  if (content === null || content === undefined) {
+    return "";
+  }
   if (typeof content === "string") {
     return content;
   }
@@ -176,6 +183,11 @@ export function messagesToPrompt(
         // Previous assistant responses for context
         parts.push(`<previous_response>\n${text}\n</previous_response>\n`);
         break;
+
+      case "tool":
+        // Client-executed tool results (OpenWebUI sends role="tool")
+        parts.push(`<tool_result>\n${text}\n</tool_result>\n`);
+        break;
     }
   }
 
@@ -183,16 +195,52 @@ export function messagesToPrompt(
 }
 
 /**
+ * Render client tool definitions as a system-level instruction block.
+ * Claude Code has no native mechanism for client-executed tools in --print
+ * mode, so we describe them and require a <tool_call> JSON envelope - the
+ * response adapter parses it back into OpenAI tool_calls.
+ */
+export function toolsToPromptBlock(tools: OpenAIToolDefinition[]): string {
+  const defs = tools
+    .map((t) => {
+      const params = t.function.parameters
+        ? JSON.stringify(t.function.parameters)
+        : "{}";
+      return `- ${t.function.name}: ${t.function.description || "(no description)"}\n  parameters: ${params}`;
+    })
+    .join("\n");
+
+  return [
+    "<available_tools>",
+    "The client provides the following tools. You CANNOT execute them yourself -",
+    "the client runs them and sends the result back as a tool message.",
+    "To request a tool call, respond with ONLY a JSON block in this exact format:",
+    '<tool_call>{"name": "<tool_name>", "arguments": {...}}</tool_call>',
+    "No other text before or after. One tool call per response.",
+    "If no tool is needed, answer normally.",
+    "",
+    defs,
+    "</available_tools>",
+  ].join("\n");
+}
+
+/**
  * Convert OpenAI chat request to CLI input format
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
   const images = extractImages(request.messages);
+  const tools = request.tools;
+  let prompt = messagesToPrompt(request.messages);
+  if (tools && tools.length > 0) {
+    prompt = toolsToPromptBlock(tools) + "\n\n" + prompt;
+  }
   return {
-    prompt: messagesToPrompt(request.messages),
+    prompt,
     model: extractModel(request.model),
     sessionId: request.user, // Use OpenAI's user field for session mapping
     effort: extractEffort(request),
     ...(images.length > 0 ? { images } : {}),
+    ...(tools && tools.length > 0 ? { tools, hasClientTools: true } : {}),
   };
 }
 
@@ -212,13 +260,19 @@ export function openaiToCliDelta(
 
   const source = newMessages.length ? newMessages : request.messages;
   const images = extractImages(source);
+  const tools = request.tools;
+  // Fallback to full history if nothing new was found (shouldn't happen,
+  // but never send an empty prompt to the CLI)
+  let prompt = messagesToPrompt(source);
+  if (tools && tools.length > 0) {
+    prompt = toolsToPromptBlock(tools) + "\n\n" + prompt;
+  }
   return {
-    // Fallback to full history if nothing new was found (shouldn't happen,
-    // but never send an empty prompt to the CLI)
-    prompt: messagesToPrompt(source),
+    prompt,
     model: extractModel(request.model),
     sessionId: request.user,
     effort: extractEffort(request),
     ...(images.length > 0 ? { images } : {}),
+    ...(tools && tools.length > 0 ? { tools, hasClientTools: true } : {}),
   };
 }

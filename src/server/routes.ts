@@ -49,6 +49,34 @@ const AUTH_EXPIRED_MESSAGE = [
   "Details: siehe DOCKER.md, Abschnitt 'Re-Login ohne Container-Zugriff'.",
 ].join("\n");
 
+/**
+ * Parse a <tool_call>{...}</tool_call> envelope from Claude's text output.
+ * Claude Code has no client-executed tool protocol in --print mode, so tool
+ * requests arrive as text; we convert them into OpenAI tool_calls.
+ */
+function parseToolCall(text: string): { name: string; arguments: string } | null {
+  const m = text.match(/<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/);
+  if (!m) return null;
+  try {
+    const parsed = JSON.parse(m[1]);
+    if (typeof parsed.name !== "string") return null;
+    return {
+      name: parsed.name,
+      arguments:
+        typeof parsed.arguments === "string"
+          ? parsed.arguments
+          : JSON.stringify(parsed.arguments ?? {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+let toolCallSeq = 0;
+function nextToolCallId(): string {
+  return `call_${Date.now().toString(36)}${(toolCallSeq++).toString(36)}`;
+}
+
 /** Build an OpenAI-style assistant message body (non-streaming) */
 function authExpiredResponse(requestId: string, model: string) {
   return {
@@ -249,6 +277,10 @@ async function handleStreamingResponse(
     let hasEmittedText = false;
     let toolCallIndex = 0;
     let inToolBlock = false;
+    let accumulatedText = "";
+    // When the client provides tools, Claude asks for them via a <tool_call>
+    // text envelope - buffer text so we can convert it into real tool_calls
+    const expectsClientTools = !!cliInput.hasClientTools;
 
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
@@ -280,15 +312,44 @@ async function handleStreamingResponse(
       }
     });
 
+    // Extended thinking: forward as OpenAI-style reasoning chunks
+    // (OpenWebUI renders delta.reasoning as a collapsible "thinking" section).
+    // Note: subscription-billed thinking is often redacted/encrypted server-side
+    // (empty deltas with only estimated_tokens) - those are skipped here.
+    subprocess.on("thinking_delta", (event: ClaudeCliStreamEvent) => {
+      const delta = event.event.delta;
+      const text = (delta?.type === "thinking_delta" && delta.thinking) || "";
+      if (text && !res.writableEnded) {
+        const chunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{
+            index: 0,
+            delta: { reasoning: text },
+            finish_reason: null,
+          }],
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+    });
+
     // Handle streaming content deltas
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const delta = event.event.delta;
       let text = (delta?.type === "text_delta" && delta.text) || "";
+      if (expectsClientTools) {
+        // Buffer instead of streaming: the text may be a <tool_call> envelope
+        // that must be converted into tool_calls, never shown to the user
+        accumulatedText += text;
+        return;
+      }
       // CLI surfaces auth failures as plain text on stdout in some failure
-      // modes - replace with actionable guidance
+      // modes - swallow them here; the error/close handlers emit the guidance
+      // message exactly once.
       if (text && subprocess.hasAuthError()) {
-        text = AUTH_EXPIRED_MESSAGE;
-        isComplete = true;
+        return;
       }
       if (text && !res.writableEnded) {
         const chunk = {
@@ -392,6 +453,55 @@ async function handleStreamingResponse(
       if (sessionCtx.sessionKey && cliInput.sessionId) {
         setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
       }
+      // Client-tool request? The streamed text is a <tool_call> envelope -
+      // replace it with proper OpenAI tool_calls chunks
+      if (expectsClientTools) {
+        const tc = parseToolCall(accumulatedText || result.result || "");
+        if (tc && !res.writableEnded) {
+          const callId = nextToolCallId();
+          const chunk = {
+            id: `chatcmpl-${requestId}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: lastModel,
+            choices: [{
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: [{
+                  index: 0,
+                  id: callId,
+                  type: "function",
+                  function: { name: tc.name, arguments: tc.arguments },
+                }],
+              },
+              finish_reason: "tool_calls",
+            }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+          resolve();
+          return;
+        }
+      }
+      // No tool call detected - flush the buffered text as regular content
+      if (expectsClientTools && accumulatedText && !res.writableEnded) {
+        const textChunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
+          choices: [{
+            index: 0,
+            delta: { role: "assistant", content: accumulatedText },
+            finish_reason: null,
+          }],
+        };
+        res.write(`data: ${JSON.stringify(textChunk)}\n\n`);
+        hasEmittedText = true;
+        isFirst = false;
+      }
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
@@ -478,6 +588,7 @@ async function handleStreamingResponse(
       sessionId: cliInput.sessionId,
       resume: sessionCtx.resume,
       effort: cliInput.effort,
+      disableBuiltinTools: cliInput.hasClientTools,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
       reject(err);
@@ -545,6 +656,40 @@ async function handleNonStreamingResponse(
         if (sessionCtx.sessionKey && cliInput.sessionId) {
           setSession(sessionCtx.sessionKey, cliInput.sessionId, sessionCtx.messageCount);
         }
+        // Client-tool request? Convert <tool_call> text into OpenAI tool_calls
+        if (cliInput.hasClientTools) {
+          const tc = parseToolCall(finalResult.result || "");
+          if (tc) {
+            res.json({
+              id: `chatcmpl-${requestId}`,
+              object: "chat.completion",
+              created: Math.floor(Date.now() / 1000),
+              model: "claude-sonnet-4",
+              choices: [{
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [{
+                    id: nextToolCallId(),
+                    type: "function",
+                    function: { name: tc.name, arguments: tc.arguments },
+                  }],
+                },
+                finish_reason: "tool_calls",
+              }],
+              usage: {
+                prompt_tokens: finalResult.usage?.input_tokens || 0,
+                completion_tokens: finalResult.usage?.output_tokens || 0,
+                total_tokens:
+                  (finalResult.usage?.input_tokens || 0) +
+                  (finalResult.usage?.output_tokens || 0),
+              },
+            });
+            resolve();
+            return;
+          }
+        }
         res.json(cliResultToOpenai(finalResult, requestId));
       } else {
         if (sessionCtx.resume && sessionCtx.sessionKey) {
@@ -575,6 +720,7 @@ async function handleNonStreamingResponse(
         sessionId: cliInput.sessionId,
         resume: sessionCtx.resume,
         effort: cliInput.effort,
+        disableBuiltinTools: cliInput.hasClientTools,
       })
       .catch((error) => {
         res.status(500).json({

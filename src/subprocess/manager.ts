@@ -24,6 +24,7 @@ import {
   isToolUseBlockStart,
   isInputJsonDelta,
   isContentBlockStop,
+  isThinkingDelta,
 } from "../types/claude-cli.js";
 import type { ClaudeModel, CliImage, ClaudeEffort } from "../adapter/openai-to-cli.js";
 import os from "os";
@@ -37,6 +38,8 @@ export interface SubprocessOptions {
   timeout?: number;
   /** Reasoning effort passed through to the CLI via --effort */
   effort?: ClaudeEffort;
+  /** Disable all built-in CLI tools (when the client provides its own tool list) */
+  disableBuiltinTools?: boolean;
   /** Images to stage as temp files so Claude can Read them */
   images?: CliImage[];
 }
@@ -104,11 +107,25 @@ export async function stageImages(images: CliImage[]): Promise<string[]> {
         const res = await fetch(img.sourceUrl, {
           signal: AbortSignal.timeout(5000),
         });
-        if (!res.ok) continue;
+        if (!res.ok || !res.body) continue;
         const contentLength = Number(res.headers.get("content-length") || 0);
         if (contentLength > MAX_IMAGE_BYTES) continue;
         mime = mime || res.headers.get("content-type") || "";
-        buffer = Buffer.from(await res.arrayBuffer());
+        // Enforce the size limit while streaming: abort as soon as the body
+        // exceeds MAX_IMAGE_BYTES instead of buffering unbounded data first
+        const chunks: Buffer[] = [];
+        let received = 0;
+        let tooLarge = false;
+        for await (const chunk of res.body) {
+          received += (chunk as Buffer).length;
+          if (received > MAX_IMAGE_BYTES) {
+            tooLarge = true;
+            break;
+          }
+          chunks.push(Buffer.from(chunk));
+        }
+        if (tooLarge) continue;
+        buffer = Buffer.concat(chunks);
       } else {
         buffer = Buffer.from(img.data, "base64");
       }
@@ -405,6 +422,12 @@ export class ClaudeSubprocess extends EventEmitter {
       args.push("--effort", options.effort);
     }
 
+    // Client-provided tools (OpenAI function calling): the CLI must NOT execute
+    // anything itself - no Bash, no Read, nothing. Execution happens client-side.
+    if (options.disableBuiltinTools) {
+      args.push("--tools", "");
+    }
+
     if (options.sessionId && options.resume) {
       // Continue a previously persisted session — avoids replaying full history
       args.push("--resume", options.sessionId);
@@ -456,6 +479,9 @@ export class ClaudeSubprocess extends EventEmitter {
         if (isContentDelta(message)) {
           // Emit content delta for streaming (text_delta only)
           this.emit("content_delta", message as ClaudeCliStreamEvent);
+        } else if (isThinkingDelta(message)) {
+          // Extended thinking stream (visible when effort > default)
+          this.emit("thinking_delta", message as unknown as ClaudeCliStreamEvent);
         } else if (isAssistantMessage(message)) {
           this.emit("assistant", message);
         } else if (isResultMessage(message)) {

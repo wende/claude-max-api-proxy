@@ -98,11 +98,14 @@ async function main(): Promise<void> {
   // Check for credentials. The CLI can also store them in the OS keychain,
   // which we can't inspect - so a missing config dir is a warning, not fatal.
   console.log("Checking authentication...");
-  const configDir = process.env.CLAUDE_CONFIG_DIR || `${process.env.HOME}/.claude`;
+  const home = process.env.HOME || "";
+  const configDir = process.env.CLAUDE_CONFIG_DIR || (home ? `${home}/.claude` : "");
   let hasCredentials = false;
   try {
     hasCredentials =
-      existsSync(configDir) && readdirSync(configDir).some((f) => f.endsWith(".json"));
+      configDir !== "" &&
+      existsSync(configDir) &&
+      readdirSync(configDir).some((f) => f.endsWith(".json"));
   } catch {
     hasCredentials = false;
   }

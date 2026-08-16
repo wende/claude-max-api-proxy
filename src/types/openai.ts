@@ -11,9 +11,22 @@ export type OpenAIContentBlock =
   | { type: "text" | "input_text"; text: string }
   | { type: "image_url"; image_url: OpenAIImageUrl };
 
+export interface OpenAIToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+  };
+}
+
 export interface OpenAIChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string | OpenAIContentBlock[];
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | OpenAIContentBlock[] | null;
+  /** Present on role="tool" messages: which tool call this result answers */
+  tool_call_id?: string;
+  /** Present on assistant messages that requested tool calls */
+  tool_calls?: OpenAIToolCall[];
 }
 
 export interface OpenAIChatRequest {
@@ -28,6 +41,8 @@ export interface OpenAIChatRequest {
   user?: string; // Used for session mapping
   reasoning_effort?: string; // OpenAI style: low/medium/high (also: xhigh/max)
   effort?: string; // Anthropic style alias
+  tools?: OpenAIToolDefinition[]; // Client-side tools (e.g. OpenWebUI functions/MCP)
+  tool_choice?: string | Record<string, unknown>;
 }
 
 export interface OpenAIToolCall {
@@ -77,6 +92,8 @@ export interface OpenAIChatResponse {
 export interface OpenAIChatChunkDelta {
   role?: "assistant";
   content?: string;
+  /** Extended thinking stream (OpenWebUI renders this as a collapsible section) */
+  reasoning?: string;
   tool_calls?: OpenAIToolCallChunk[];
 }
 
