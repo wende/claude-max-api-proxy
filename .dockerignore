@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+*.md
+!README.md
+docs
+.DS_Store
+npm-debug.log
